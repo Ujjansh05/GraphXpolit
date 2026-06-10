@@ -1,5 +1,16 @@
 # GraphXploit
 
+
+<p align="center">
+  <img 
+    src="https://github.com/user-attachments/assets/927ab6da-0a3a-4f7e-9ce5-48c6ddb99d89"
+    alt="GraphXploit Logo"
+    width="400"
+  />
+</p>
+
+
+
 GraphXploit is an impact analysis platform for large Python codebases. It parses code into Abstract Syntax Trees (AST), structures the dependencies within a TigerGraph database, and leverages Large Language Models to evaluate the downstream impact of structural changes.
 
 ## Architecture
