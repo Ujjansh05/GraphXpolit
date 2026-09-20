@@ -1,0 +1,107 @@
+{
+  "idle": {
+    "seconds": 5,
+    "cpu_seconds": 0.0,
+    "working_set_mib": 5.96
+  },
+  "unescaped_script_in_bootstrap": true,
+  "foreign_host_can_read_bootstrap_token": true,
+  "four_scan_requests": [
+    {
+      "http": 200,
+      "id": "job-2",
+      "status": "running",
+      "summary": null,
+      "error": null
+    },
+    {
+      "http": 200,
+      "id": "job-3",
+      "status": "running",
+      "summary": null,
+      "error": null
+    },
+    {
+      "http": 200,
+      "id": "job-4",
+      "status": "running",
+      "summary": null,
+      "error": null
+    },
+    {
+      "http": 200,
+      "id": "job-5",
+      "status": "running",
+      "summary": null,
+      "error": null
+    }
+  ],
+  "cancel_seconds": 0.199,
+  "cancel_outcomes": [
+    {
+      "id": "job-2",
+      "status": "cancelled",
+      "summary": {
+        "root": "\\\\?\\C:\\Users\\ujjan\\AppData\\Local\\Temp\\graphxploit-extra-dh0bzp20\\project",
+        "database": "C:\\Users\\ujjan\\AppData\\Local\\Temp\\graphxploit-extra-dh0bzp20\\data\\GraphXploit\\projects\\1d6b7d9bb4a53bc155fba444.db",
+        "files_seen": 100,
+        "files_parsed": 0,
+        "files_skipped": 0,
+        "symbols": 0,
+        "relationships": 0,
+        "diagnostics": 0,
+        "cancelled": true
+      },
+      "error": null
+    },
+    {
+      "id": "job-3",
+      "status": "cancelled",
+      "summary": {
+        "root": "\\\\?\\C:\\Users\\ujjan\\AppData\\Local\\Temp\\graphxploit-extra-dh0bzp20\\project",
+        "database": "C:\\Users\\ujjan\\AppData\\Local\\Temp\\graphxploit-extra-dh0bzp20\\data\\GraphXploit\\projects\\1d6b7d9bb4a53bc155fba444.db",
+        "files_seen": 100,
+        "files_parsed": 0,
+        "files_skipped": 0,
+        "symbols": 0,
+        "relationships": 0,
+        "diagnostics": 0,
+        "cancelled": true
+      },
+      "error": null
+    },
+    {
+      "id": "job-4",
+      "status": "cancelled",
+      "summary": {
+        "root": "\\\\?\\C:\\Users\\ujjan\\AppData\\Local\\Temp\\graphxploit-extra-dh0bzp20\\project",
+        "database": "C:\\Users\\ujjan\\AppData\\Local\\Temp\\graphxploit-extra-dh0bzp20\\data\\GraphXploit\\projects\\1d6b7d9bb4a53bc155fba444.db",
+        "files_seen": 100,
+        "files_parsed": 0,
+        "files_skipped": 0,
+        "symbols": 0,
+        "relationships": 0,
+        "diagnostics": 0,
+        "cancelled": true
+      },
+      "error": null
+    },
+    {
+      "id": "job-5",
+      "status": "cancelled",
+      "summary": {
+        "root": "\\\\?\\C:\\Users\\ujjan\\AppData\\Local\\Temp\\graphxploit-extra-dh0bzp20\\project",
+        "database": "C:\\Users\\ujjan\\AppData\\Local\\Temp\\graphxploit-extra-dh0bzp20\\data\\GraphXploit\\projects\\1d6b7d9bb4a53bc155fba444.db",
+        "files_seen": 100,
+        "files_parsed": 0,
+        "files_skipped": 0,
+        "symbols": 0,
+        "relationships": 0,
+        "diagnostics": 0,
+        "cancelled": true
+      },
+      "error": null
+    }
+  ],
+  "oversized_json_status": 413
+}

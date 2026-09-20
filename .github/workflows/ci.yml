@@ -1,0 +1,48 @@
+name: Lightweight build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Check optional existing-model support
+        run: cargo check --features ai
+      - name: Release build
+        run: cargo build --release
+      - name: Enforce compressed-free binary budget
+        shell: pwsh
+        run: |
+          $binary = if ($IsWindows) { 'target/release/graphxploit.exe' } else { 'target/release/graphxploit' }
+          if ((Get-Item $binary).Length -gt 25MB) {
+            throw "Release binary exceeds the 25 MiB budget."
+          }
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphxploit-${{ matrix.os }}
+          path: target/release/graphxploit*
+          if-no-files-found: error

@@ -43,3 +43,6 @@ files.txt
 .pytest_cache/
 .pytest_tmp/
 pytest-cache-files-*/
+
+# Rust build outputs
+/target/

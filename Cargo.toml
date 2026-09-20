@@ -1,0 +1,44 @@
+[package]
+name = "graphxploit"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Local, lightweight code impact analysis"
+license = "MIT"
+repository = "https://github.com/Ujjansh05/GraphXpolit"
+keywords = ["code-analysis", "impact-analysis", "dependencies", "ast"]
+categories = ["development-tools", "command-line-utilities"]
+
+[features]
+default = []
+ai = ["dep:reqwest"]
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tree-sitter = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
+[dev-dependencies]
+tempfile = "3.15"
+
+[profile.release]
+codegen-units = 1
+debug = false
+lto = "thin"
+opt-level = "z"
+panic = "abort"
+strip = "symbols"

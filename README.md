@@ -1,124 +1,73 @@
-# GraphXploit
+# GraphXploit 2.0
 
+GraphXploit is a local, lightweight code-impact analyzer. It indexes a source tree on the user's machine, then shows callers, dependencies, and a read-only source excerpt. It never executes the analyzed project.
 
-<p align="center">
-  <img 
-    src="https://github.com/user-attachments/assets/927ab6da-0a3a-4f7e-9ce5-48c6ddb99d89"
-    alt="GraphXploit Logo"
-    width="400"
-  />
-</p>
+The active implementation is a single Rust executable with embedded SQLite. It replaces the previous TigerGraph/Docker prototype as the supported deployment path.
 
+## What users need
 
+Download the executable for their operating system from a GitHub Release, put it on `PATH`, and run it. There is no installer, account, Docker daemon, database service, browser extension, GPU, model download, Node.js, Python, or network connection required.
 
-GraphXploit is an impact analysis platform for large Python codebases. It parses code into Abstract Syntax Trees (AST), structures the dependencies within a TigerGraph database, and leverages Large Language Models to evaluate the downstream impact of structural changes.
-
-## Architecture
-
-```text
-CLIENT                     BACKEND                     GRAPH & LLM
-                         
-┌─────────────┐          ┌─────────────┐             ┌─────────────┐
-│ CLI / React │ ───────▶ │ FastAPI     │ ──────────▶ │ TigerGraph  │
-└─────────────┘          └─────────────┘             └─────────────┘
-                               │
-                               │                     ┌─────────────┐
-                               └───────────────────▶ │ LLM Backend │
-                                                     └─────────────┘
-```
-
-The system operates in three phases:
-1. **Parsing:** Source files are parsed into functions, classes, calls, and imports.
-2. **Graph Traversal:** TigerGraph determines complex downstream call-graphs.
-3. **Synthesis:** An LLM generates a human-readable impact report based on the isolated subgraph.
-
-## Installation
-
-**Linux / macOS:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/Ujjansh05/GraphXpolit/main/install.sh | bash
-```
-
-**Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/Ujjansh05/GraphXpolit/main/install.ps1 | iex
+# Windows
+graphxploit.exe scan C:\path\to\project
+graphxploit.exe impact C:\path\to\project "src/auth.py::login"
+graphxploit.exe serve
 ```
-
-**Or install directly via pip:**
-```bash
-pip install graphxploit-analyzer
-```
-
-## Quick Start
-
-Initialize the datastores (requires Docker):
-```bash
-graphxploit start
-```
-
-Analyze a local project:
-```bash
-graphxploit analyze ./path/to/project
-```
-
-Query the impact graph:
-```bash
-graphxploit query "What breaks if I change the login function?"
-```
-
-## UI Dashboard
-
-To launch the web interface and API server:
-```bash
-graphxploit visualize
-```
-*In development scenarios, run `npm run dev` in the `frontend/` directory to access the interface at `localhost:5173`.*
-
-## Model configuration
-
-GraphXploit utilizes a "Bring Your Own Model" (BYOM) architecture. By default, it runs a local Ollama instance. You can mount external providers such as OpenAI or HuggingFace endpoints.
-
-All configurations are securely encrypted locally at `~/.graphxploit/models.json`.
 
 ```bash
-# Enter the interactive model setup
-graphxploit model mount
-
-# View available models
-graphxploit model list
-
-# Switch active model context
-graphxploit model switch <model_id>
+# Linux
+./graphxploit scan /path/to/project
+./graphxploit dependencies /path/to/project 'src/auth.py::login'
+./graphxploit serve
 ```
 
-## Available commands
+`serve` binds only to `127.0.0.1` and prints the address for a small read-only dashboard to open in a normal browser. It does not expose a network service to other devices.
 
-| Command | Description |
-|---------|-------------|
-| `graphxploit analyze <path>` | Full pipeline: parse, graph, load, query |
-| `graphxploit model <cmd>` | Manage LLM integrations |
-| `graphxploit query <query>` | Natural language impact query |
-| `graphxploit start` | Start infrastructure containers |
-| `graphxploit status` | Health-check services |
-| `graphxploit stop` | Stop and tear down containers |
-| `graphxploit visualize`| Spin up the UI server |
+## Resource profile
 
-## Development
+- One portable executable: the verified default Windows release build is about **6.2 MB**, with a CI limit of 25 MiB per binary.
+- One embedded SQLite database per indexed project, stored in the user's local application-data directory. No server or container is installed.
+- Incremental rescans skip unchanged files. Files over 2 MiB and common build, dependency, virtual-environment, and VCS folders are skipped by default.
+- The analyzer reads source text and stores metadata only. It does not run the project, install dependencies, invoke compilers, or download models.
+
+This design is intended for ordinary 4 GB laptops and is materially lighter than a browser-plus-server-plus-graph-database stack.
+
+## Supported languages and analysis
+
+Python, JavaScript, TypeScript, Go, Rust, and Java are parsed locally with Tree-sitter. GraphXploit indexes files, declarations, direct calls, and imports, then follows the stored graph for impact or dependency queries.
+
+Static local targets are resolved when unambiguous. Dynamic dispatch, reflection, generated code, macros, and ambiguous calls are retained as unresolved rather than guessed. Treat results as review evidence, not a claim of complete semantic analysis.
+
+## Optional existing AI model
+
+AI is deliberately excluded from the default download. If a user already runs an Ollama or OpenAI-compatible endpoint, a maintainer can build the separate optional feature:
+
+```powershell
+cargo build --release --features ai
+graphxploit.exe model configure ollama http://127.0.0.1:11434 qwen2.5-coder:7b
+graphxploit.exe explain C:\path\to\project "src/auth.py::login"
+```
+
+Model configuration stores only the endpoint, model identifier, and an optional environment-variable name for an API key. It never saves key values. The AI request contains a compact impact summary only; source contents are not sent. `send_source` is disabled by design.
+
+## Build from source
+
+Rust stable (1.85+) is required only for contributors building from source.
 
 ```bash
-# Clone the repository
-git clone https://github.com/Ujjansh05/GraphXpolit.git
-cd GraphXpolit
-
-# Install in editable mode
-pip install -e ".[dev]"
-
-# Run backend API
-uvicorn backend.main:app --reload --port 8000
-
-# Run frontend UI
-cd frontend && npm install && npm run dev
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build --release
 ```
 
-## License
-MIT
+The executable is created at `target/release/graphxploit` (`.exe` on Windows). GitHub Actions validates Windows and Linux builds, tests, formatting, linting, and the binary-size budget, then attaches platform executables to the workflow run.
+
+## Data and privacy
+
+Set `GRAPHXPLOIT_DATA_DIR` to choose where project indexes are stored. Without it, GraphXploit uses the operating system's normal local application-data location. Delete that `GraphXploit/projects` directory to remove all indexes; it contains generated metadata and will be rebuilt on the next scan.
+
+## Legacy prototype
+
+The Python/FastAPI/TigerGraph/Docker code remains in this repository only as historical reference. It is not the deployment target for GraphXploit 2.0 and its old installation commands should not be used.

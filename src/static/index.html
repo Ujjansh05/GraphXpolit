@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>GraphXploit</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <main>
+    <header><div><h1>GraphXploit</h1><p>Local dependency and impact analysis</p></div><span id="status">Ready</span></header>
+    <section class="card">
+      <label for="root">Project directory</label>
+      <div class="row"><input id="root" spellcheck="false" placeholder="C:\\projects\\my-app"><button id="scan">Scan project</button><button id="cancel" class="secondary" disabled>Cancel</button></div>
+      <p class="hint">Only local source metadata is indexed. Docker, a graph server, model download, and GPU are not required.</p>
+      <pre id="scan-result" class="hidden"></pre>
+    </section>
+    <section class="card">
+      <div class="row query-row"><input id="target" spellcheck="false" placeholder="Symbol, file, or fully qualified name"><select id="mode"><option value="impact">Impact</option><option value="dependencies">Dependencies</option></select><button id="query">Analyze</button></div>
+      <p class="hint">Impact follows callers and importers. Results are potential effects supported by indexed paths.</p>
+      <div id="message" role="status"></div>
+       <div id="results"></div>
+       <pre id="source" class="hidden" aria-live="polite"></pre>
+    </section>
+  </main>
+  <script>window.GRAPHXPLOIT_TOKEN = __GRAPHXPLOIT_TOKEN__; window.GRAPHXPLOIT_ROOT = __GRAPHXPLOIT_ROOT__;</script>
+  <script src="/app.js"></script>
+</body>
+</html>

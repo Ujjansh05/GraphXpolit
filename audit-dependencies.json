@@ -1,0 +1,6 @@
+{
+  "source": "https://api.osv.dev/v1/querybatch",
+  "registry_packages_checked": 193,
+  "scope": "entire Cargo.lock including optional and development dependencies; no claim about reachability",
+  "matches": []
+}
