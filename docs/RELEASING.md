@@ -14,8 +14,8 @@ A tag beginning with `v` triggers locked Windows and Linux builds of the default
 ```bash
 git switch main
 git pull --ff-only origin main
-git tag -a v2.0.0 -m "GraphXploit 2.0.0"
-git push origin v2.0.0
+git tag -a v2.0.1 -m "GraphXploit 2.0.1"
+git push origin v2.0.1
 ```
 
 The workflow creates:
