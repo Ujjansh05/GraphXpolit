@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const SCHEMA_VERSION: i64 = 1;
 
@@ -261,9 +262,14 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn rebuild_edges(&mut self) -> Result<usize> {
-        self.conn
-            .execute("DELETE FROM edges WHERE project_id=?1", [self.project_id])?;
+    pub(crate) fn rebuild_edges(
+        &mut self,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Option<usize>> {
+        if cancellation_requested(cancelled) {
+            return Ok(None);
+        }
+
         let symbols = self.symbols()?;
         let mut by_name: HashMap<String, Vec<&SymbolRecord>> = HashMap::new();
         let mut file_nodes = HashMap::new();
@@ -278,19 +284,24 @@ impl Store {
                 by_name.entry(symbol.name.clone()).or_default().push(symbol);
             }
         }
+
         let transaction = self.conn.transaction()?;
+        transaction.execute("DELETE FROM edges WHERE project_id=?1", [self.project_id])?;
         let mut edges = 0usize;
         for symbol in &symbols {
+            if cancellation_requested(cancelled) {
+                return Ok(None);
+            }
             if symbol.kind != "File" {
                 if let Some(file_node) = file_nodes.get(&symbol.file_id) {
-                    transaction.execute(
+                    edges += transaction.execute(
                         "INSERT OR IGNORE INTO edges(project_id, source_id, target_id, kind) VALUES (?1, ?2, ?3, 'CONTAINS')",
                         params![self.project_id, file_node, symbol.id],
                     )?;
-                    edges += 1;
                 }
             }
         }
+
         let mut statement = transaction.prepare(
             "SELECT source_symbol_id, raw_target, line FROM symbol_references WHERE project_id=?1",
         )?;
@@ -301,10 +312,21 @@ impl Store {
                 row.get::<_, u32>(2)?,
             ))
         })?;
+        let mut references = Vec::new();
+        for row in rows {
+            if cancellation_requested(cancelled) {
+                return Ok(None);
+            }
+            references.push(row?);
+        }
+        drop(statement);
+
         let by_id: HashMap<i64, &SymbolRecord> =
             symbols.iter().map(|symbol| (symbol.id, symbol)).collect();
-        for row in rows {
-            let (source_id, raw_target, line) = row?;
+        for (source_id, raw_target, line) in references {
+            if cancellation_requested(cancelled) {
+                return Ok(None);
+            }
             let Some(source) = by_id.get(&source_id) else {
                 continue;
             };
@@ -312,26 +334,14 @@ impl Store {
             let Some(candidates) = by_name.get(&name) else {
                 continue;
             };
-            let target = candidates
-                .iter()
-                .find(|candidate| candidate.file_id == source.file_id)
-                .copied()
-                .or_else(|| {
-                    if candidates.len() == 1 {
-                        candidates.first().copied()
-                    } else {
-                        None
-                    }
-                });
-            if let Some(target) = target {
-                transaction.execute(
+            if let Some(target) = select_unambiguous_target(candidates, source.file_id) {
+                edges += transaction.execute(
                     "INSERT OR IGNORE INTO edges(project_id, source_id, target_id, kind, evidence_line) VALUES (?1, ?2, ?3, 'CALLS', ?4)",
                     params![self.project_id, source_id, target.id, line],
                 )?;
-                edges += 1;
             }
         }
-        drop(statement);
+
         let mut imports = transaction
             .prepare("SELECT source_file_id, raw_target, line FROM imports WHERE project_id=?1")?;
         let rows = imports.query_map([self.project_id], |row| {
@@ -341,8 +351,19 @@ impl Store {
                 row.get::<_, u32>(2)?,
             ))
         })?;
+        let mut import_rows = Vec::new();
         for row in rows {
-            let (source_file_id, raw_target, line) = row?;
+            if cancellation_requested(cancelled) {
+                return Ok(None);
+            }
+            import_rows.push(row?);
+        }
+        drop(imports);
+
+        for (source_file_id, raw_target, line) in import_rows {
+            if cancellation_requested(cancelled) {
+                return Ok(None);
+            }
             let Some(source_id) = file_nodes.get(&source_file_id) else {
                 continue;
             };
@@ -354,18 +375,16 @@ impl Store {
                     .and_then(|part| file_modules.get(part).copied())
             });
             if let Some(target_id) = target.filter(|target| *target != *source_id) {
-                transaction.execute(
+                edges += transaction.execute(
                     "INSERT OR IGNORE INTO edges(project_id, source_id, target_id, kind, evidence_line) VALUES (?1, ?2, ?3, 'IMPORTS', ?4)",
                     params![self.project_id, source_id, target_id, line],
                 )?;
-                edges += 1;
             }
         }
-        drop(imports);
-        transaction.commit()?;
-        Ok(edges)
-    }
 
+        transaction.commit()?;
+        Ok(Some(edges))
+    }
     pub(crate) fn symbols(&self) -> Result<Vec<SymbolRecord>> {
         let mut statement = self.conn.prepare(
             "SELECT s.id, s.file_id, s.name, s.qualified_name, s.kind, f.rel_path, s.start_line
@@ -423,14 +442,19 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub(crate) fn neighbors(&self, node_id: i64, reverse: bool) -> Result<Vec<EdgeRecord>> {
+    pub(crate) fn neighbors(
+        &self,
+        node_id: i64,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<Vec<EdgeRecord>> {
         let sql = if reverse {
-            "SELECT source_id, target_id, kind FROM edges WHERE project_id=?1 AND target_id=?2 AND kind IN ('CALLS','IMPORTS')"
+            "SELECT source_id, target_id, kind FROM edges WHERE project_id=?1 AND target_id=?2 AND kind IN ('CALLS','IMPORTS') ORDER BY source_id, target_id LIMIT ?3"
         } else {
-            "SELECT source_id, target_id, kind FROM edges WHERE project_id=?1 AND source_id=?2 AND kind IN ('CALLS','IMPORTS')"
+            "SELECT source_id, target_id, kind FROM edges WHERE project_id=?1 AND source_id=?2 AND kind IN ('CALLS','IMPORTS') ORDER BY source_id, target_id LIMIT ?3"
         };
         let mut statement = self.conn.prepare(sql)?;
-        let rows = statement.query_map(params![self.project_id, node_id], |row| {
+        let rows = statement.query_map(params![self.project_id, node_id, limit as i64], |row| {
             Ok(EdgeRecord {
                 source_id: row.get(0)?,
                 target_id: row.get(1)?,
@@ -440,7 +464,6 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
-
     pub(crate) fn count(&self, table: &str) -> Result<usize> {
         let allowed = match table {
             "files" | "symbols" | "edges" | "diagnostics" => table,
@@ -504,6 +527,25 @@ fn terminal_name(value: &str) -> String {
         .to_owned()
 }
 
+fn cancellation_requested(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+fn select_unambiguous_target<'a>(
+    candidates: &'a [&SymbolRecord],
+    file_id: i64,
+) -> Option<&'a SymbolRecord> {
+    let same_file = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.file_id == file_id)
+        .collect::<Vec<_>>();
+    match same_file.as_slice() {
+        [candidate] => Some(*candidate),
+        [] if candidates.len() == 1 => Some(candidates[0]),
+        _ => None,
+    }
+}
 fn module_keys(path: &str) -> Vec<String> {
     let normalized = path.replace('\\', "/");
     let stem = normalized

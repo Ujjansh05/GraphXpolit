@@ -1,12 +1,13 @@
 # Releasing GraphXploit
 
-GitHub Actions builds the default lightweight executable for Windows and Linux when a tag beginning with `v` is pushed. It publishes ZIP files to a GitHub Release.
+A tag beginning with `v` triggers locked Windows and Linux builds of the default lightweight executable. The workflow tests the default build, checks that the tag equals the `Cargo.toml` version, enforces the 25 MiB executable ceiling, and publishes each ZIP with a SHA-256 file.
 
 ## Before tagging
 
-1. Ensure the main-branch CI workflow is green.
-2. Review [AUDIT.md](../AUDIT.md). Do not publish a public release while its release-blocking findings remain unresolved.
-3. Update the version in `Cargo.toml` and any release notes as needed.
+1. Merge only after main-branch formatting, all-feature Clippy/tests, RustSec audit, release build, and size checks are green.
+2. Review [AUDIT.md](../AUDIT.md) and document any new known limitation.
+3. Update the version in `Cargo.toml`, run `cargo update --workspace` if needed, and commit the resulting `Cargo.lock`.
+4. Smoke-test `doctor`, `scan`, `impact`, and `serve` using the release binary.
 
 ## Create a release
 
@@ -17,11 +18,9 @@ git tag -a v2.0.0 -m "GraphXploit 2.0.0"
 git push origin v2.0.0
 ```
 
-The `Publish release` workflow creates:
+The workflow creates:
 
-- `graphxploit-windows-x86_64.zip`
-- `graphxploit-linux-x86_64.zip`
+- `graphxploit-windows-x86_64.zip` and `.zip.sha256`
+- `graphxploit-linux-x86_64.zip` and `.zip.sha256`
 
-Check the workflow logs and download both assets from the created release for a manual smoke test before announcing it.
-
-If the release job cannot create a release, ensure GitHub Actions has write permission to repository contents. The workflow requests `contents: write`.
+Download both platform assets after publishing, verify their checksums, and run a clean-machine smoke test before announcing the release. The publish job alone receives `contents: write`; build jobs remain read-only.

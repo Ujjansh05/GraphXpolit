@@ -205,7 +205,7 @@ async fn main() -> Result<()> {
         Some(Command::Doctor) => {
             println!("GraphXploit {}", env!("CARGO_PKG_VERSION"));
             println!("Storage: {}", graphxploit::store::app_data_dir()?.display());
-            println!("Supported parsers: Python, JavaScript/TypeScript, Go, Rust, Java");
+            println!("Supported parsers: Python, JavaScript/TypeScript/TSX, Go, Rust, Java");
             println!("No Docker, TigerGraph, Ollama, Node.js, or GPU is required.");
             println!("Optional existing-model support: build with `--features ai`.");
         }

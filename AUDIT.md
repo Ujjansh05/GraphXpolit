@@ -1,51 +1,30 @@
 # Runtime and security audit
 
-This document summarizes a local audit of the GraphXploit 2.0 Rust application.
-It is not a security certification. Raw benchmark data and developer harnesses
-are intentionally excluded from this public repository because they included
-local machine details.
+This document records the production-hardening state of GraphXploit 2.0 as verified on 2026-09-22. It is an engineering verification record, not a security certification. Raw benchmark harnesses are excluded because they contained local-machine details.
 
-## Measured prototype results
+## Verified release baseline
 
-The default Windows release executable measured 6.2 MB. On synthetic Python
-projects, initial scans measured 2.15 seconds and 8.53 MiB peak working set for
-100 files, 19.34 seconds and 22.02 MiB for 1,000 files, and 95.07 seconds and
-63.07 MiB for 5,000 files. An unchanged 5,000-file rescan took 3.60 seconds.
-The dashboard server measured 5.96 MiB at idle in a short Windows observation.
+- The locked default Windows release built successfully and measured 7,660,032 bytes (7.31 MiB), below the enforced 25 MiB ceiling.
+- Formatting passed; Clippy passed with warnings denied for every target and feature; all 15 unit/regression tests passed with every feature enabled.
+- A release-binary smoke test completed `doctor`, incremental sample scanning, and an impact query.
+- A live dashboard probe returned HTTP 200 for the local page, 403 for a hostile `Host`, 403 for a cross-site request, and 401 for an API request without its token. CSP and `nosniff` headers were present.
+- CI now runs a pinned RustSec audit against `Cargo.lock`. A previous OSV check found no advisory match for the public registry packages then present in the lockfile.
 
-These were single-run synthetic results on a Windows 11 laptop with 16 GB RAM;
-they do not guarantee memory, CPU, latency, browser use, or index size on any
-other device. The audit found no advisory matches in OSV for the 193 public
-registry package/version pairs in Cargo.lock at the time of checking.
+## Resolved release blockers
 
-## Checks that passed
+1. The dashboard validates exact loopback hosts, same-origin requests, and browser fetch metadata before returning bootstrap data.
+2. Dashboard tokens use 256 bits of operating-system randomness; dynamic bootstrap values are JSON encoded; restrictive response headers are applied.
+3. JSON bodies, source previews, query depth/results/visits, source discovery, concurrent scans, retained jobs, and optional-model responses are bounded.
+4. Edge rebuilding is transactional and cancellable. Ambiguous overloads are no longer guessed, duplicate qualified names remain distinct, and partial queries are marked incomplete.
+5. Optional model URLs are structurally parsed. Remote HTTP, embedded credentials, queries, redirects, unsafe secret-variable names, source sharing, and oversized prompts/responses are rejected.
+6. Release automation tests locked sources, enforces the binary budget, verifies tag/version agreement, publishes SHA-256 files, pins third-party actions, and receives Dependabot updates.
 
-- The default release build and existing Rust tests passed.
-- The server binds to `127.0.0.1`.
-- Missing or incorrect dashboard tokens returned HTTP 401.
-- Ordinary relative and absolute source-path escape attempts returned HTTP 400.
-- Oversized JSON requests returned HTTP 413.
-- The default analyzer does not execute indexed source or download models.
+## Earlier performance observations
 
-## Release-blocking fixes
+On synthetic Python projects, initial scans measured 2.15 seconds and 8.53 MiB peak working set for 100 files, 19.34 seconds and 22.02 MiB for 1,000 files, and 95.07 seconds and 63.07 MiB for 5,000 files. An unchanged 5,000-file rescan took 3.60 seconds. The dashboard measured 5.96 MiB at idle.
 
-Do not make a public production release until these are fixed and retested:
+These were single runs on one Windows 11 laptop with 16 GB RAM and predate the latest hardening changes. They do not guarantee memory, CPU, latency, browser use, or index size on another device.
 
-1. Validate dashboard Host and Origin headers so a hostile hostname cannot
-   retrieve the page bootstrap token.
-2. Parse AI endpoint URLs and validate the actual hostname/IP. String-prefix
-   checks accepted lookalike non-loopback hosts over HTTP.
-3. Enforce result limits during traversal, bound source-excerpt reads, limit
-   concurrent scan jobs, expire completed jobs, and cap model response sizes.
-4. Generate the dashboard token from the operating system's cryptographic
-   random source; safely escape bootstrap data and add response security headers.
-5. Make the release workflow run tests, enforce the binary-size budget, use a
-   locked dependency build, and publish checksums or signed artifacts.
+## Remaining external validation
 
-## Not yet verified
-
-Real Linux installation, 4 GB hardware, browser memory, large real projects,
-long-running/concurrent use, fuzzing, live optional-model providers, and
-published-release integrity still need testing.
-
-Read [docs/SECURITY.md](docs/SECURITY.md) before distributing GraphXploit.
+Before claiming support for a new platform or scale, test it there. Real low-memory hardware, large real repositories, long-running/concurrent use, fuzzing, live third-party model providers, Linux distribution compatibility, code signing, and independently reproduced release artifacts have not yet been fully validated. Static call analysis also cannot guarantee coverage of dynamic dispatch, reflection, generated code, or runtime behavior.

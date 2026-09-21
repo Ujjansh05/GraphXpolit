@@ -418,6 +418,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "getrandom 0.4.3",
  "hex",
  "reqwest",
  "rusqlite",

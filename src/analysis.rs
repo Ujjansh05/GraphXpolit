@@ -3,7 +3,8 @@ use crate::store::{Store, SymbolRecord};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -15,6 +16,12 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RETURNED_NODES: usize = 500;
 const MAX_VISITED_NODES: usize = 10_000;
+const MAX_QUERY_DEPTH: u32 = 25;
+const MAX_SOURCE_EXCERPT_LINES: usize = 200;
+const MAX_SOURCE_EXCERPT_BYTES: u64 = 256 * 1024;
+const MAX_DISCOVERED_FILES: usize = 100_000;
+const MAX_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_TARGET_BYTES: usize = 4096;
 
 #[derive(Clone)]
 pub struct ScanOptions {
@@ -44,12 +51,12 @@ struct SourceFile {
 
 pub fn scan_project(root: &Path, options: ScanOptions) -> Result<crate::model::ProjectSummary> {
     let mut store = Store::open(root)?;
-    let sources = discover_source_files(store.root())?;
+    let sources = discover_source_files(store.root(), &options)?;
     let existing = store.existing_files()?;
     let mut seen = HashSet::new();
     let mut parsed_count = 0usize;
     let mut skipped_count = 0usize;
-    let mut cancelled = false;
+    let mut cancelled = is_cancelled(&options);
 
     for source in &sources {
         if is_cancelled(&options) {
@@ -82,8 +89,30 @@ pub fn scan_project(root: &Path, options: ScanOptions) -> Result<crate::model::P
             skipped_count += 1;
             continue;
         }
-        let content = fs::read(&source.absolute)
+        let mut content = Vec::with_capacity(source.length.min(options.max_file_bytes) as usize);
+        File::open(&source.absolute)
+            .with_context(|| format!("could not open {}", source.absolute.display()))?
+            .take(options.max_file_bytes + 1)
+            .read_to_end(&mut content)
             .with_context(|| format!("could not read {}", source.absolute.display()))?;
+        if content.len() as u64 > options.max_file_bytes {
+            let parsed = ParsedFile {
+                diagnostic: Some(format!(
+                    "Skipped {} because it grew beyond the configured {} byte limit.",
+                    source.relative, options.max_file_bytes
+                )),
+                ..Default::default()
+            };
+            store.replace_file(
+                &source.relative,
+                "oversized",
+                source.modified_ns,
+                source.language.label(),
+                &parsed,
+            )?;
+            parsed_count += 1;
+            continue;
+        }
         let hash = hex::encode(Sha256::digest(&content));
         if unchanged.is_some_and(|record| record.hash == hash) {
             skipped_count += 1;
@@ -107,7 +136,17 @@ pub fn scan_project(root: &Path, options: ScanOptions) -> Result<crate::model::P
             }
         }
     }
-    let relationships = store.rebuild_edges()?;
+    let relationships = if cancelled {
+        store.count("edges")?
+    } else {
+        match store.rebuild_edges(options.cancelled.as_deref())? {
+            Some(count) => count,
+            None => {
+                cancelled = true;
+                store.count("edges")?
+            }
+        }
+    };
     store.touch()?;
     store.summary(
         sources.len(),
@@ -127,6 +166,10 @@ pub fn dependencies(root: &Path, target: &str, depth: u32) -> Result<QueryResult
 }
 
 fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<QueryResult> {
+    let target = target.trim();
+    if target.is_empty() || target.len() > MAX_TARGET_BYTES {
+        anyhow::bail!("target must contain between 1 and {MAX_TARGET_BYTES} bytes");
+    }
     let store = Store::open(root)?;
     let target_records = store.find_symbols(target)?;
     let mode = if reverse { "impact" } else { "dependencies" }.to_owned();
@@ -144,6 +187,8 @@ fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Que
             message: Some("More than one symbol matches this name.".to_owned()),
         });
     }
+    let requested_depth = depth;
+    let depth = depth.min(MAX_QUERY_DEPTH);
     let symbols = store.symbols()?;
     let by_id: HashMap<i64, &SymbolRecord> =
         symbols.iter().map(|symbol| (symbol.id, symbol)).collect();
@@ -160,8 +205,8 @@ fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Que
         }
     }
     let mut results = Vec::new();
-    let mut complete = true;
-    while let Some((current, current_depth, route)) = queue.pop_front() {
+    let mut complete = requested_depth <= MAX_QUERY_DEPTH;
+    'search: while let Some((current, current_depth, route)) = queue.pop_front() {
         if current_depth >= depth {
             continue;
         }
@@ -169,7 +214,15 @@ fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Que
             complete = false;
             break;
         }
-        for edge in store.neighbors(current, reverse)? {
+        let edges = store.neighbors(current, reverse, MAX_RETURNED_NODES + 1)?;
+        if edges.len() > MAX_RETURNED_NODES {
+            complete = false;
+        }
+        for edge in edges {
+            if visited.len() >= MAX_VISITED_NODES || results.len() >= MAX_RETURNED_NODES {
+                complete = false;
+                break 'search;
+            }
             let next = if reverse {
                 edge.source_id
             } else {
@@ -206,7 +259,9 @@ fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Que
             queue.push_back((next, current_depth + 1, next_route));
         }
     }
-    let message = if results.is_empty() {
+    let message = if !complete {
+        Some(format!("The result was safely truncated at {MAX_RETURNED_NODES} nodes, {MAX_VISITED_NODES} visited nodes, or depth {MAX_QUERY_DEPTH}. Narrow the target or depth for a complete result."))
+    } else if results.is_empty() {
         Some("No indexed dependency path was found. Dynamic calls, reflection, generated code, and ambiguous names are intentionally reported as unresolved rather than guessed.".to_owned())
     } else {
         None
@@ -221,28 +276,43 @@ fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Que
         message,
     })
 }
-
 pub fn source_excerpt(
     root: &Path,
     relative_path: &str,
     start_line: usize,
     end_line: usize,
 ) -> Result<String> {
+    if start_line == 0 || end_line < start_line {
+        anyhow::bail!("source line range is invalid");
+    }
+    if end_line.saturating_sub(start_line) > MAX_SOURCE_EXCERPT_LINES {
+        anyhow::bail!("source excerpt is limited to {MAX_SOURCE_EXCERPT_LINES} lines");
+    }
     let root = root.canonicalize()?;
     let candidate = root.join(relative_path).canonicalize()?;
-    if !candidate.starts_with(&root) {
-        anyhow::bail!("source path is outside the selected project");
+    if !candidate.starts_with(&root) || !candidate.is_file() {
+        anyhow::bail!("source path is outside the selected project or is not a file");
     }
-    let text = fs::read_to_string(candidate)?;
-    Ok(text
+    let metadata = candidate.metadata()?;
+    if metadata.len() > DEFAULT_MAX_FILE_BYTES {
+        anyhow::bail!("source file exceeds the safe preview size");
+    }
+    let mut text = String::new();
+    File::open(candidate)?
+        .take(DEFAULT_MAX_FILE_BYTES + 1)
+        .read_to_string(&mut text)?;
+    let excerpt = text
         .lines()
         .enumerate()
-        .filter(|(index, _)| *index >= start_line.saturating_sub(1) && *index < end_line)
+        .filter(|(index, _)| *index >= start_line - 1 && *index < end_line)
         .map(|(index, line)| format!("{:>5}  {line}", index + 1))
         .collect::<Vec<_>>()
-        .join("\n"))
+        .join("\n");
+    if excerpt.len() as u64 > MAX_SOURCE_EXCERPT_BYTES {
+        anyhow::bail!("source excerpt exceeds the safe response size");
+    }
+    Ok(excerpt)
 }
-
 fn is_cancelled(options: &ScanOptions) -> bool {
     options
         .cancelled
@@ -250,10 +320,10 @@ fn is_cancelled(options: &ScanOptions) -> bool {
         .is_some_and(|value| value.load(Ordering::Relaxed))
 }
 
-fn discover_source_files(root: &Path) -> Result<Vec<SourceFile>> {
+fn discover_source_files(root: &Path, options: &ScanOptions) -> Result<Vec<SourceFile>> {
     let ignores = read_ignore_rules(root);
     let mut result = Vec::new();
-    visit_directory(root, root, &ignores, &mut result)?;
+    visit_directory(root, root, &ignores, options, &mut result)?;
     result.sort_by(|a, b| a.relative.cmp(&b.relative));
     Ok(result)
 }
@@ -262,9 +332,13 @@ fn visit_directory(
     root: &Path,
     directory: &Path,
     ignores: &[String],
+    options: &ScanOptions,
     result: &mut Vec<SourceFile>,
 ) -> Result<()> {
     for entry in fs::read_dir(directory)? {
+        if is_cancelled(options) {
+            return Ok(());
+        }
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
@@ -280,11 +354,16 @@ fn visit_directory(
             if should_skip_directory(&name) {
                 continue;
             }
-            visit_directory(root, &path, ignores, result)?;
+            visit_directory(root, &path, ignores, options, result)?;
         } else if file_type.is_file() {
             let Some(language) = language_for_path(&path) else {
                 continue;
             };
+            if result.len() >= MAX_DISCOVERED_FILES {
+                anyhow::bail!(
+                    "project exceeds the {MAX_DISCOVERED_FILES} source-file safety limit; add dependency or generated directories to .graphxploitignore"
+                );
+            }
             let metadata = entry.metadata()?;
             let modified_ns = metadata
                 .modified()
@@ -303,7 +382,6 @@ fn visit_directory(
     }
     Ok(())
 }
-
 fn should_skip_directory(name: &str) -> bool {
     matches!(
         name,
@@ -325,7 +403,15 @@ fn should_skip_directory(name: &str) -> bool {
 fn read_ignore_rules(root: &Path) -> Vec<String> {
     let mut rules = vec!["*.min.js".to_owned()];
     for filename in [".gitignore", ".graphxploitignore"] {
-        if let Ok(text) = fs::read_to_string(root.join(filename)) {
+        let path = root.join(filename);
+        let mut bytes = Vec::new();
+        let readable = File::open(path)
+            .and_then(|file| file.take(MAX_IGNORE_FILE_BYTES + 1).read_to_end(&mut bytes))
+            .is_ok();
+        if !readable || bytes.len() as u64 > MAX_IGNORE_FILE_BYTES {
+            continue;
+        }
+        if let Ok(text) = String::from_utf8(bytes) {
             rules.extend(
                 text.lines()
                     .map(str::trim)
@@ -338,7 +424,6 @@ fn read_ignore_rules(root: &Path) -> Vec<String> {
     }
     rules
 }
-
 fn ignored(name: &str, relative: &str, rules: &[String]) -> bool {
     rules.iter().any(|rule| {
         let rule = rule.trim_end_matches('/');
@@ -359,7 +444,8 @@ fn language_for_path(path: &Path) -> Option<Language> {
     {
         "py" => Some(Language::Python),
         "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
-        "ts" | "tsx" => Some(Language::TypeScript),
+        "ts" => Some(Language::TypeScript),
+        "tsx" => Some(Language::Tsx),
         "go" => Some(Language::Go),
         "rs" => Some(Language::Rust),
         "java" => Some(Language::Java),
@@ -405,10 +491,17 @@ fn grammar(language: Language) -> TsLanguage {
         Language::Python => tree_sitter_python::LANGUAGE.into(),
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         Language::Go => tree_sitter_go::LANGUAGE.into(),
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::Java => tree_sitter_java::LANGUAGE.into(),
     }
+}
+
+#[derive(Clone)]
+struct Scope {
+    name: String,
+    qualified_name: String,
 }
 
 fn walk(
@@ -416,7 +509,7 @@ fn walk(
     source: &[u8],
     language: Language,
     relative_path: &str,
-    scopes: &mut Vec<String>,
+    scopes: &mut Vec<Scope>,
     parsed: &mut ParsedFile,
 ) {
     if is_import(node.kind(), language) {
@@ -429,30 +522,55 @@ fn walk(
         let local_qualified = if scopes.is_empty() {
             name.clone()
         } else {
-            format!("{}.{}", scopes.join("."), name)
+            format!(
+                "{}.{}",
+                scopes
+                    .iter()
+                    .map(|scope| scope.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+                name
+            )
         };
-        let qualified_name = format!("{relative_path}::{local_qualified}");
+        let base_qualified = format!("{relative_path}::{local_qualified}");
+        let qualified_name = if parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.qualified_name == base_qualified)
+        {
+            format!(
+                "{base_qualified}@{}:{}",
+                node.start_position().row + 1,
+                node.start_position().column + 1
+            )
+        } else {
+            base_qualified
+        };
         parsed.symbols.push(ParsedSymbol {
             name: name.clone(),
-            qualified_name,
+            qualified_name: qualified_name.clone(),
             kind,
             start_line: node.start_position().row as u32 + 1,
             end_line: node.end_position().row as u32 + 1,
         });
-        scopes.push(name);
+        scopes.push(Scope {
+            name,
+            qualified_name,
+        });
         walk_children(node, source, language, relative_path, scopes, parsed);
         scopes.pop();
         return;
     }
-    if is_call(node.kind(), language) && !scopes.is_empty() {
-        let raw_target = call_target(node, source);
-        if !raw_target.is_empty() {
-            let qualified = format!("{relative_path}::{}", scopes.join("."));
-            parsed.references.push(ParsedReference {
-                source_qualified_name: qualified,
-                raw_target,
-                line: node.start_position().row as u32 + 1,
-            });
+    if is_call(node.kind(), language) {
+        if let Some(scope) = scopes.last() {
+            let raw_target = call_target(node, source);
+            if !raw_target.is_empty() {
+                parsed.references.push(ParsedReference {
+                    source_qualified_name: scope.qualified_name.clone(),
+                    raw_target,
+                    line: node.start_position().row as u32 + 1,
+                });
+            }
         }
     }
     walk_children(node, source, language, relative_path, scopes, parsed);
@@ -463,7 +581,7 @@ fn walk_children(
     source: &[u8],
     language: Language,
     relative_path: &str,
-    scopes: &mut Vec<String>,
+    scopes: &mut Vec<Scope>,
     parsed: &mut ParsedFile,
 ) {
     let mut cursor = node.walk();
@@ -471,7 +589,6 @@ fn walk_children(
         walk(child, source, language, relative_path, scopes, parsed);
     }
 }
-
 fn declaration(node: Node<'_>, source: &[u8], language: Language) -> Option<(String, String)> {
     let kind = node.kind();
     let mapped = match language {
@@ -480,12 +597,19 @@ fn declaration(node: Node<'_>, source: &[u8], language: Language) -> Option<(Str
             "class_definition" => "Class",
             _ => return None,
         },
-        Language::JavaScript | Language::TypeScript => match kind {
+        Language::JavaScript | Language::TypeScript | Language::Tsx => match kind {
             "function_declaration" | "generator_function_declaration" | "method_definition" => {
                 "Function"
             }
             "class_declaration" => "Class",
             "interface_declaration" => "Interface",
+            "variable_declarator"
+                if node.child_by_field_name("value").is_some_and(|value| {
+                    matches!(value.kind(), "arrow_function" | "function_expression")
+                }) =>
+            {
+                "Function"
+            }
             _ => return None,
         },
         Language::Go => match kind {
@@ -505,6 +629,13 @@ fn declaration(node: Node<'_>, source: &[u8], language: Language) -> Option<(Str
             "method_declaration" | "constructor_declaration" => "Function",
             "class_declaration" => "Class",
             "interface_declaration" => "Interface",
+            "variable_declarator"
+                if node.child_by_field_name("value").is_some_and(|value| {
+                    matches!(value.kind(), "arrow_function" | "function_expression")
+                }) =>
+            {
+                "Function"
+            }
             "enum_declaration" => "Enum",
             _ => return None,
         },
@@ -645,5 +776,67 @@ mod tests {
                 "missing {caller}"
             );
         }
+    }
+
+    #[test]
+    fn caps_large_query_results_exactly() {
+        let temp = tempdir().unwrap();
+        let mut source = "def target():\n    return 1\n\n".to_owned();
+        for index in 0..600 {
+            source.push_str(&format!("def caller_{index}():\n    return target()\n\n"));
+        }
+        fs::write(temp.path().join("large.py"), source).unwrap();
+        scan_project(temp.path(), ScanOptions::default()).unwrap();
+        let result = impact(temp.path(), "target", 5).unwrap();
+        assert_eq!(result.results.len(), MAX_RETURNED_NODES);
+        assert!(!result.complete);
+    }
+
+    #[test]
+    fn enforces_source_preview_boundaries() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("small.rs"), "fn main() {}\n").unwrap();
+        assert!(source_excerpt(temp.path(), "small.rs", 0, 1).is_err());
+        assert!(source_excerpt(temp.path(), "small.rs", 1, 202).is_err());
+        fs::write(
+            temp.path().join("large.rs"),
+            vec![b'a'; DEFAULT_MAX_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(source_excerpt(temp.path(), "large.rs", 1, 2).is_err());
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        assert!(
+            source_excerpt(temp.path(), outside.path().to_string_lossy().as_ref(), 1, 2).is_err()
+        );
+    }
+
+    #[test]
+    fn indexes_tsx_arrow_function_calls() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("widget.tsx"),
+            "const target = () => 1;\nexport const caller = () => target();\n",
+        )
+        .unwrap();
+        scan_project(temp.path(), ScanOptions::default()).unwrap();
+        let result = impact(temp.path(), "target", 5).unwrap();
+        assert!(result
+            .results
+            .iter()
+            .any(|node| node.qualified_name.ends_with("::caller")));
+    }
+
+    #[test]
+    fn keeps_overloads_distinct_and_ambiguous() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("Demo.java"),
+            "class Demo { void call(int value) {} void call(String value) {} }\n",
+        )
+        .unwrap();
+        scan_project(temp.path(), ScanOptions::default()).unwrap();
+        let result = impact(temp.path(), "call", 5).unwrap();
+        assert_eq!(result.candidates.len(), 2);
+        assert!(result.results.is_empty());
     }
 }

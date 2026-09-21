@@ -4,9 +4,10 @@ GraphXploit runs on a local source directory. It creates an index outside the pr
 
 ## Windows
 
-1. Download and extract `graphxploit-windows-x86_64.zip` from the repository Releases page.
-2. Open PowerShell in the extracted folder.
-3. Run `./graphxploit.exe --help` to confirm that it starts.
+1. Download `graphxploit-windows-x86_64.zip` and its `.sha256` file from Releases.
+2. In PowerShell, compare `(Get-FileHash .\graphxploit-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()` with the first value in the `.sha256` file, then extract the ZIP.
+3. Open PowerShell in the extracted folder.
+4. Run `./graphxploit.exe --help` to confirm that it starts.
 
 ```powershell
 .\graphxploit.exe scan "C:\Users\you\source\my-project"
@@ -16,6 +17,7 @@ GraphXploit runs on a local source directory. It creates an index outside the pr
 ## Linux
 
 ```bash
+sha256sum -c graphxploit-linux-x86_64.zip.sha256
 unzip graphxploit-linux-x86_64.zip
 chmod +x graphxploit
 ./graphxploit --help

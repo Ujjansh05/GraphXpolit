@@ -6,6 +6,7 @@ pub enum Language {
     Python,
     JavaScript,
     TypeScript,
+    Tsx,
     Go,
     Rust,
     Java,
@@ -16,7 +17,7 @@ impl Language {
         match self {
             Self::Python => "Python",
             Self::JavaScript => "JavaScript",
-            Self::TypeScript => "TypeScript",
+            Self::TypeScript | Self::Tsx => "TypeScript",
             Self::Go => "Go",
             Self::Rust => "Rust",
             Self::Java => "Java",

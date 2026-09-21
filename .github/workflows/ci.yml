@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: ${{ matrix.os }}
@@ -17,23 +21,21 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
           components: rustfmt, clippy
       - name: Format
-        run: cargo fmt --check
-      - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test
-      - name: Check optional existing-model support
-        run: cargo check --features ai
-      - name: Release build
-        run: cargo build --release
-      - name: Enforce compressed-free binary budget
+        run: cargo fmt --all -- --check
+      - name: Lint every target and feature
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Test every feature
+        run: cargo test --all-features --locked
+      - name: Build default lightweight release
+        run: cargo build --release --locked
+      - name: Enforce uncompressed binary budget
         shell: pwsh
         run: |
           $binary = if ($IsWindows) { 'target/release/graphxploit.exe' } else { 'target/release/graphxploit' }
@@ -41,8 +43,18 @@ jobs:
             throw "Release binary exceeds the 25 MiB budget."
           }
       - name: Upload executable
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: graphxploit-${{ matrix.os }}
           path: target/release/graphxploit*
           if-no-files-found: error
+
+  dependency-audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Audit Cargo.lock
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
