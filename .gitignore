@@ -1,48 +1,20 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-*.egg
-.venv/
-venv/
-env/
+# Local credentials and application data
 .env
 .env.*
 *.env
-*.env.*
-!.env.example
-!*.env.example
-# Real config env files (keep only *.example)
-config/*.env
-!config/*.env.example
-# Auto-generated API key
-~/.graphxploit/server.key
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+/.graphxploit-data/
 
-# Node / Frontend
-node_modules/
-frontend/dist/
-frontend/build/
+# Rust build output
+/target/
 
-# IDE
+# Local tooling
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Misc
-*.log
-files.txt
-
-# Test artifacts
-.pytest_cache/
-.pytest_tmp/
-pytest-cache-files-*/
-
-# Rust build outputs
-/target/
