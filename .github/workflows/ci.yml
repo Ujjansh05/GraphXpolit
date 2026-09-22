@@ -31,23 +31,28 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint every target and feature
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      - name: Test every feature
+      - name: Test Lite edition
+        run: cargo test --locked
+      - name: Test AI edition
         run: cargo test --all-features --locked
-      - name: Build default lightweight release
+      - name: Build default Lite release
         run: cargo build --release --locked
-      - name: Enforce uncompressed binary budget
+      - name: Enforce Lite binary budget
         shell: pwsh
         run: |
           $binary = if ($IsWindows) { 'target/release/graphxploit.exe' } else { 'target/release/graphxploit' }
           if ((Get-Item $binary).Length -gt 25MB) {
-            throw "Release binary exceeds the 25 MiB budget."
+            throw "Lite binary exceeds the 25 MiB budget."
           }
-      - name: Upload executable
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: graphxploit-${{ matrix.os }}
-          path: target/release/graphxploit*
-          if-no-files-found: error
+      - name: Build AI release
+        run: cargo build --release --locked --features ai
+      - name: Enforce AI binary budget
+        shell: pwsh
+        run: |
+          $binary = if ($IsWindows) { 'target/release/graphxploit.exe' } else { 'target/release/graphxploit' }
+          if ((Get-Item $binary).Length -gt 35MB) {
+            throw "AI binary exceeds the 35 MiB budget."
+          }
 
   dependency-audit:
     name: RustSec dependency audit

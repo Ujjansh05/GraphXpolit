@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.target }} ${{ matrix.edition }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -17,10 +17,32 @@ jobs:
         include:
           - os: windows-latest
             target: windows-x86_64
+            edition: lite
+            feature_args: ""
             binary: target/release/graphxploit.exe
+            archive: graphxploit-windows-x86_64.zip
+            budget_mb: 25
+          - os: windows-latest
+            target: windows-x86_64
+            edition: ai
+            feature_args: "--features ai"
+            binary: target/release/graphxploit.exe
+            archive: graphxploit-windows-x86_64-ai.zip
+            budget_mb: 35
           - os: ubuntu-latest
             target: linux-x86_64
+            edition: lite
+            feature_args: ""
             binary: target/release/graphxploit
+            archive: graphxploit-linux-x86_64.zip
+            budget_mb: 25
+          - os: ubuntu-latest
+            target: linux-x86_64
+            edition: ai
+            feature_args: "--features ai"
+            binary: target/release/graphxploit
+            archive: graphxploit-linux-x86_64-ai.zip
+            budget_mb: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Set up Rust
@@ -40,28 +62,32 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint every target and feature
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      - name: Test every feature
+      - name: Test Lite edition
+        run: cargo test --locked
+      - name: Test AI edition
         run: cargo test --all-features --locked
-      - name: Build locked lightweight binary
-        run: cargo build --release --locked
+      - name: Build locked ${{ matrix.edition }} binary
+        shell: pwsh
+        run: cargo build --release --locked ${{ matrix.feature_args }}
       - name: Enforce size, package, and checksum
         shell: pwsh
         run: |
           $binary = '${{ matrix.binary }}'
-          if ((Get-Item $binary).Length -gt 25MB) {
-            throw "Release binary exceeds the 25 MiB budget."
+          $budget = [int]'${{ matrix.budget_mb }}' * 1MB
+          if ((Get-Item $binary).Length -gt $budget) {
+            throw "Release binary exceeds the ${{ matrix.budget_mb }} MiB budget."
           }
-          $archive = 'graphxploit-${{ matrix.target }}.zip'
+          $archive = '${{ matrix.archive }}'
           Compress-Archive -LiteralPath $binary -DestinationPath $archive
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $archive" | Set-Content "$archive.sha256" -NoNewline
       - name: Upload release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: graphxploit-${{ matrix.target }}
+          name: graphxploit-${{ matrix.target }}-${{ matrix.edition }}
           path: |
-            graphxploit-${{ matrix.target }}.zip
-            graphxploit-${{ matrix.target }}.zip.sha256
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
           if-no-files-found: error
 
   publish:

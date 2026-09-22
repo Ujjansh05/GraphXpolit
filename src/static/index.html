@@ -3,27 +3,92 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark light">
-  <title>GraphXploit</title>
+  <meta name="color-scheme" content="dark">
+  <title>GraphXploit Workbench</title>
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
+  <header class="topbar">
+    <div><h1>GraphXploit</h1><p>Understand change before it ships.</p></div>
+    <div class="topmeta"><span id="edition" class="badge">Loading…</span><span id="status">Ready</span></div>
+  </header>
   <main>
-    <header><div><h1>GraphXploit</h1><p>Local dependency and impact analysis</p></div><span id="status">Ready</span></header>
-    <section class="card">
-      <label for="root">Project directory</label>
-      <div class="row"><input id="root" spellcheck="false" placeholder="C:\\projects\\my-app"><button id="scan">Scan project</button><button id="cancel" class="secondary" disabled>Cancel</button></div>
-      <p class="hint">Only local source metadata is indexed. Docker, a graph server, model download, and GPU are not required.</p>
-      <pre id="scan-result" class="hidden"></pre>
+    <section class="card project">
+      <div class="section-head"><div><h2>Project</h2><p>Local-first index. No Docker, browser engine, graph server, or GPU.</p></div></div>
+      <div class="controls">
+        <input id="root" class="grow" spellcheck="false" aria-label="Project directory" placeholder="C:\projects\my-app">
+        <button id="scan">Scan project</button>
+        <button id="cancel" class="secondary" disabled>Cancel</button>
+      </div>
+      <pre id="scan-result" class="notice hidden"></pre>
     </section>
-    <section class="card">
-      <div class="row query-row"><input id="target" spellcheck="false" placeholder="Symbol, file, or fully qualified name"><select id="mode"><option value="impact">Impact</option><option value="dependencies">Dependencies</option></select><button id="query">Analyze</button></div>
-      <p class="hint">Impact follows callers and importers. Results are potential effects supported by indexed paths.</p>
-      <div id="message" role="status"></div>
-       <div id="results"></div>
-       <pre id="source" class="hidden" aria-live="polite"></pre>
+
+    <nav class="tabs" aria-label="Workspace">
+      <button class="tab active" data-panel="explore">Explore</button>
+      <button class="tab" data-panel="changes">Changes</button>
+      <button class="tab" data-panel="chat">Code chat</button>
+    </nav>
+
+    <section id="explore-panel" class="panel card">
+      <div class="section-head"><div><h2>Code graph</h2><p>Search symbols, follow dependencies or callers, and inspect source.</p></div></div>
+      <div class="controls">
+        <input id="target" class="grow" spellcheck="false" aria-label="Symbol target" placeholder="Search symbol, file, or qualified name">
+        <button id="search" class="secondary">Search</button>
+        <select id="direction" aria-label="Graph direction">
+          <option value="dependencies">Dependencies</option>
+          <option value="impact">Impact</option>
+        </select>
+        <label class="compact">Depth <input id="depth" type="number" min="1" max="12" value="4"></label>
+        <button id="graph">Visualize</button>
+      </div>
+      <div id="search-results" class="suggestions hidden"></div>
+      <div id="graph-message" class="message" role="status">Scan a project, then choose a symbol.</div>
+      <div class="workspace">
+        <div id="graph-wrap" class="graph-wrap" tabindex="0" aria-label="Interactive code graph">
+          <svg id="graph-svg" viewBox="0 0 1000 600" role="img" aria-label="Dependency graph">
+            <g id="viewport"><g id="edges"></g><g id="nodes"></g></g>
+          </svg>
+          <div class="graph-help">Wheel to zoom · drag to pan · select a node for source</div>
+        </div>
+        <aside class="inspector">
+          <h3>Inspector</h3>
+          <div id="inspector-meta" class="muted">Select a graph node or search result.</div>
+          <pre id="source" class="source hidden" aria-live="polite"></pre>
+        </aside>
+      </div>
+    </section>
+
+    <section id="changes-panel" class="panel card hidden">
+      <div class="section-head"><div><h2>Git change impact</h2><p>Map working-tree or branch changes to indexed symbols and their dependants.</p></div></div>
+      <div class="controls">
+        <select id="git-mode"><option value="working">Working changes</option><option value="branch">Compare branch</option></select>
+        <input id="git-base" spellcheck="false" value="main" aria-label="Base revision">
+        <button id="git-analyze">Analyze changes</button>
+      </div>
+      <div id="git-message" class="message"></div>
+      <div id="git-results" class="list"></div>
+    </section>
+
+    <section id="chat-panel" class="panel card hidden">
+      <div class="section-head"><div><h2>Low-token code chat</h2><p>GraphXploit selects compact evidence locally. You approve every source excerpt before an AI request.</p></div><span id="token-budget-label" class="badge">4,000 token budget</span></div>
+      <div class="controls">
+        <textarea id="question" class="grow" rows="3" maxlength="4000" placeholder="What could break if I change this authentication function?"></textarea>
+      </div>
+      <div class="controls">
+        <input id="chat-target" class="grow" spellcheck="false" placeholder="Optional target symbol">
+        <label class="compact">Budget <input id="token-budget" type="range" min="1000" max="8000" step="250" value="4000"></label>
+        <button id="preview">Build preview</button>
+      </div>
+      <div id="chat-message" class="message">Source never leaves this machine until you approve the preview.</div>
+      <div id="preview-box" class="preview-box hidden">
+        <div class="preview-head"><strong id="preview-summary"></strong><div><button id="select-all" class="link-button">Select all</button><button id="copy-context" class="link-button">Copy context</button></div></div>
+        <div id="evidence" class="evidence"></div>
+        <div class="controls approve-row"><label><input id="approve-check" type="checkbox"> I reviewed and approve the selected evidence.</label><button id="ask" disabled>Send selected context</button></div>
+      </div>
+      <article id="answer" class="answer hidden"><h3>Answer</h3><pre id="answer-text"></pre><div id="answer-meta" class="muted"></div></article>
     </section>
   </main>
+  <footer>All indexing and graph analysis are local. AI is optional and disabled in Lite edition.</footer>
   <script src="/bootstrap.js"></script>
   <script src="/app.js"></script>
 </body>

@@ -60,6 +60,7 @@ pub struct ProjectSummary {
     pub relationships: usize,
     pub diagnostics: usize,
     pub cancelled: bool,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,6 +79,7 @@ pub struct ImpactNode {
     pub path: String,
     pub line: u32,
     pub depth: u32,
+    pub relationship: String,
     /// The dependency route from this result towards the selected target.
     pub evidence_path: Vec<String>,
 }
@@ -90,5 +92,94 @@ pub struct QueryResult {
     pub candidates: Vec<Candidate>,
     pub complete: bool,
     pub visited: usize,
+    pub message: Option<String>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResult {
+    pub items: Vec<Candidate>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub path: String,
+    pub line: u32,
+    pub depth: u32,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphEdge {
+    pub source: String,
+    pub target: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphResult {
+    pub target: String,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub complete: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextEvidence {
+    pub id: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub relationship: String,
+    pub source: Option<String>,
+    pub estimated_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPreview {
+    pub preview_id: String,
+    pub question: String,
+    pub target: Option<String>,
+    pub revision: String,
+    pub evidence: Vec<ContextEvidence>,
+    pub estimated_tokens: usize,
+    pub budget_tokens: usize,
+    pub complete: bool,
+    pub model_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatAnswer {
+    pub answer: String,
+    pub citations: Vec<String>,
+    pub estimated_input_tokens: usize,
+    pub provider_input_tokens: Option<usize>,
+    pub provider_output_tokens: Option<usize>,
+    pub citation_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangedSymbol {
+    pub status: String,
+    pub path: String,
+    pub old_path: Option<String>,
+    pub qualified_name: String,
+    pub kind: String,
+    pub line: u32,
+    pub affected: Vec<ImpactNode>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangeImpact {
+    pub mode: String,
+    pub base_revision: String,
+    pub head_revision: String,
+    pub changes: Vec<ChangedSymbol>,
+    pub complete: bool,
     pub message: Option<String>,
 }

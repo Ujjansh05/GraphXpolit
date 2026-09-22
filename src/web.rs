@@ -1,5 +1,11 @@
-use crate::analysis::{dependencies, impact, scan_project, source_excerpt, ScanOptions};
-use crate::model::{ProjectSummary, QueryResult};
+use crate::analysis::{
+    context_preview, dependencies, graph, impact, scan_project, search, source_excerpt, ScanOptions,
+};
+use crate::git::{branch_changes, working_changes};
+use crate::model::{
+    ChangeImpact, ChatAnswer, ContextPreview, GraphResult, ProjectSummary, QueryResult,
+    SearchResult,
+};
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, State},
@@ -24,18 +30,30 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_JSON_BODY_BYTES: usize = 64 * 1024;
 const MAX_ACTIVE_SCANS: usize = 1;
 const MAX_STORED_JOBS: usize = 32;
 const JOB_TTL: Duration = Duration::from_secs(10 * 60);
+const PREVIEW_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_STORED_PREVIEWS: usize = 16;
 
 #[derive(Clone)]
 struct AppState {
     token: Arc<String>,
     default_root: Option<String>,
     jobs: Arc<Mutex<HashMap<String, Job>>>,
+    previews: Arc<Mutex<HashMap<String, StoredPreview>>>,
+    read_slots: Arc<Semaphore>,
+    model_slot: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct StoredPreview {
+    preview: ContextPreview,
+    created_at: Instant,
 }
 
 #[derive(Clone)]
@@ -74,6 +92,66 @@ struct SourceRequest {
     end_line: usize,
 }
 
+#[derive(Deserialize)]
+struct SearchRequest {
+    root: String,
+    query: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    25
+}
+
+#[derive(Deserialize)]
+struct GraphRequest {
+    root: String,
+    target: String,
+    #[serde(default = "default_depth")]
+    depth: u32,
+    #[serde(default)]
+    reverse: bool,
+}
+
+#[derive(Deserialize)]
+struct ContextRequest {
+    root: String,
+    question: String,
+    target: Option<String>,
+    #[serde(default = "default_context_budget")]
+    budget_tokens: usize,
+}
+
+fn default_context_budget() -> usize {
+    4_000
+}
+
+#[derive(Deserialize)]
+struct ChatRequest {
+    preview_id: String,
+    evidence_ids: Vec<String>,
+    #[serde(default)]
+    approved: bool,
+}
+
+#[derive(Deserialize)]
+struct GitRequest {
+    root: String,
+    #[serde(default)]
+    mode: String,
+    base: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Capabilities {
+    edition: &'static str,
+    ai_enabled: bool,
+    max_graph_nodes: usize,
+    max_context_tokens: usize,
+    preview_ttl_seconds: u64,
+}
+
 #[derive(Serialize)]
 struct JobResponse {
     id: String,
@@ -102,6 +180,9 @@ pub async fn serve(default_root: Option<PathBuf>, port: u16) -> anyhow::Result<(
         token: Arc::new(token),
         default_root,
         jobs: Arc::new(Mutex::new(HashMap::new())),
+        previews: Arc::new(Mutex::new(HashMap::new())),
+        read_slots: Arc::new(Semaphore::new(2)),
+        model_slot: Arc::new(Semaphore::new(1)),
     };
     let app = Router::new()
         .route("/", get(index))
@@ -111,9 +192,15 @@ pub async fn serve(default_root: Option<PathBuf>, port: u16) -> anyhow::Result<(
         .route("/api/v1/scan", post(start_scan))
         .route("/api/v1/jobs/{id}", get(job_status))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
+        .route("/api/v1/capabilities", get(capabilities))
+        .route("/api/v1/search", post(run_search))
+        .route("/api/v1/graph", post(run_graph))
         .route("/api/v1/impact", post(run_impact))
         .route("/api/v1/dependencies", post(run_dependencies))
         .route("/api/v1/source", post(read_source))
+        .route("/api/v1/context", post(build_context))
+        .route("/api/v1/chat", post(run_chat))
+        .route("/api/v1/git-impact", post(run_git_impact))
         .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES))
         .layer(middleware::from_fn(local_request_guard))
         .with_state(state);
@@ -397,17 +484,156 @@ async fn cancel_job(
     Ok(Json(job_response(id, job)))
 }
 
+async fn capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Capabilities> {
+    authenticate(&headers, &state)?;
+    Ok(Json(Capabilities {
+        edition: if cfg!(feature = "ai") { "AI" } else { "Lite" },
+        ai_enabled: cfg!(feature = "ai"),
+        max_graph_nodes: 300,
+        max_context_tokens: 8_000,
+        preview_ttl_seconds: PREVIEW_TTL.as_secs(),
+    }))
+}
+
+async fn run_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SearchRequest>,
+) -> ApiResult<SearchResult> {
+    authenticate(&headers, &state)?;
+    let root = request_root(&request.root)?;
+    let query = request.query.trim().to_owned();
+    run_read(&state, move || search(&root, &query, request.limit)).await
+}
+
+async fn run_graph(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<GraphRequest>,
+) -> ApiResult<GraphResult> {
+    authenticate(&headers, &state)?;
+    let root = request_root(&request.root)?;
+    let target = request.target.trim().to_owned();
+    run_read(&state, move || {
+        graph(&root, &target, request.depth, request.reverse)
+    })
+    .await
+}
+
+async fn build_context(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ContextRequest>,
+) -> ApiResult<ContextPreview> {
+    authenticate(&headers, &state)?;
+    let root = request_root(&request.root)?;
+    let question = request.question.trim().to_owned();
+    let target = request.target.filter(|value| !value.trim().is_empty());
+    let endpoint = crate::ai::configured_endpoint();
+    let preview = run_read(&state, move || {
+        context_preview(
+            &root,
+            &question,
+            target.as_deref(),
+            true,
+            Some(request.budget_tokens),
+            endpoint,
+        )
+    })
+    .await?
+    .0;
+    let mut previews = state.previews.lock().map_err(|_| preview_storage_error())?;
+    prune_previews(&mut previews);
+    if previews.len() >= MAX_STORED_PREVIEWS {
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many context previews are open. Wait for an older preview to expire.".to_owned(),
+        ));
+    }
+    previews.insert(
+        preview.preview_id.clone(),
+        StoredPreview {
+            preview: preview.clone(),
+            created_at: Instant::now(),
+        },
+    );
+    Ok(Json(preview))
+}
+
+async fn run_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ChatRequest>,
+) -> ApiResult<ChatAnswer> {
+    authenticate(&headers, &state)?;
+    if !request.approved {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Explicit evidence approval is required before a model request.".to_owned(),
+        ));
+    }
+    let preview = {
+        let mut previews = state.previews.lock().map_err(|_| preview_storage_error())?;
+        prune_previews(&mut previews);
+        previews
+            .get(&request.preview_id)
+            .map(|stored| stored.preview.clone())
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::NOT_FOUND,
+                    "This preview expired or is unknown. Build a new preview before sending."
+                        .to_owned(),
+                )
+            })?
+    };
+    let _permit = state
+        .model_slot
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| worker_error())?;
+    crate::ai::ask_preview(&preview, &request.evidence_ids)
+        .await
+        .map(Json)
+        .map_err(bad_request)
+}
+
+async fn run_git_impact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<GitRequest>,
+) -> ApiResult<ChangeImpact> {
+    authenticate(&headers, &state)?;
+    let root = request_root(&request.root)?;
+    let mode = request.mode.trim().to_ascii_lowercase();
+    if mode != "working" && mode != "branch" {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Git mode must be 'working' or 'branch'.".to_owned(),
+        ));
+    }
+    run_read(&state, move || {
+        if mode == "branch" {
+            branch_changes(&root, request.base.as_deref().unwrap_or("main"))
+        } else {
+            working_changes(&root)
+        }
+    })
+    .await
+}
+
 async fn run_impact(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResult>, ApiError> {
     authenticate(&headers, &state)?;
-    let root = canonical_project_root(FsPath::new(request.root.trim()))
-        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
-    impact(&root, request.target.trim(), request.depth)
-        .map(Json)
-        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))
+    let root = request_root(&request.root)?;
+    let target = request.target.trim().to_owned();
+    run_read(&state, move || impact(&root, &target, request.depth)).await
 }
 
 async fn run_dependencies(
@@ -416,11 +642,9 @@ async fn run_dependencies(
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResult>, ApiError> {
     authenticate(&headers, &state)?;
-    let root = canonical_project_root(FsPath::new(request.root.trim()))
-        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
-    dependencies(&root, request.target.trim(), request.depth)
-        .map(Json)
-        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))
+    let root = request_root(&request.root)?;
+    let target = request.target.trim().to_owned();
+    run_read(&state, move || dependencies(&root, &target, request.depth)).await
 }
 
 async fn read_source(
@@ -429,11 +653,54 @@ async fn read_source(
     Json(request): Json<SourceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authenticate(&headers, &state)?;
-    let root = canonical_project_root(FsPath::new(request.root.trim()))
-        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
-    source_excerpt(&root, &request.path, request.start_line, request.end_line)
-        .map(|content| Json(serde_json::json!({"content": content})))
-        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))
+    let root = request_root(&request.root)?;
+    run_read(&state, move || {
+        source_excerpt(&root, &request.path, request.start_line, request.end_line)
+            .map(|content| serde_json::json!({"content": content}))
+    })
+    .await
+}
+
+async fn run_read<T, F>(state: &AppState, task: F) -> ApiResult<T>
+where
+    T: Serialize + Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let permit = state
+        .read_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| worker_error())?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task()
+    })
+    .await
+    .map_err(|_| worker_error())?;
+    result.map(Json).map_err(bad_request)
+}
+
+fn request_root(value: &str) -> Result<PathBuf, ApiError> {
+    canonical_project_root(FsPath::new(value.trim())).map_err(bad_request)
+}
+
+fn bad_request(error: anyhow::Error) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, error.to_string())
+}
+
+fn worker_error() -> ApiError {
+    ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The local worker is unavailable.".to_owned(),
+    )
+}
+
+fn preview_storage_error() -> ApiError {
+    ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Context preview storage is unavailable.".to_owned(),
+    )
 }
 
 fn job_storage_error() -> ApiError {
@@ -459,6 +726,10 @@ fn prune_jobs(jobs: &mut HashMap<String, Job>) {
                 .completed_at
                 .is_some_and(|finished| finished.elapsed() < JOB_TTL)
     });
+}
+
+fn prune_previews(previews: &mut HashMap<String, StoredPreview>) {
+    previews.retain(|_, stored| stored.created_at.elapsed() < PREVIEW_TTL);
 }
 
 fn canonical_project_root(path: &FsPath) -> anyhow::Result<PathBuf> {

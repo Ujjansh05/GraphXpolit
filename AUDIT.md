@@ -1,30 +1,55 @@
 # Runtime and security audit
 
-This document records the production-hardening state of GraphXploit 2.0 as verified on 2026-09-22. It is an engineering verification record, not a security certification. Raw benchmark harnesses are excluded because they contained local-machine details.
+This document records the GraphXploit 2.1.0 engineering verification performed on 2026-09-22. It is not a security certification or a performance guarantee.
 
-## Verified release baseline
+## Verified in this change
 
-- The locked default Windows release built successfully and measured 7,660,032 bytes (7.31 MiB), below the enforced 25 MiB ceiling.
-- Formatting passed; Clippy passed with warnings denied for every target and feature; all 15 unit/regression tests passed with every feature enabled.
-- A release-binary smoke test completed `doctor`, incremental sample scanning, and an impact query.
-- A live dashboard probe returned HTTP 200 for the local page, 403 for a hostile `Host`, 403 for a cross-site request, and 401 for an API request without its token. CSP and `nosniff` headers were present.
-- CI now runs a pinned RustSec audit against `Cargo.lock`. A previous OSV check found no advisory match for the public registry packages then present in the lockfile.
+- Rust formatting passes.
+- Strict Clippy passes for every target and feature with warnings denied.
+- All 19 unit/regression tests pass with every feature, including parsing, ambiguity, exact query caps, path boundaries, transactional cancellation, graph/search/context, Git parsing, endpoint validation, token generation, browser request checks, and evidence citation extraction.
+- JavaScript syntax validation passes for the embedded dependency-free dashboard.
+- Locked Lite and AI Windows release builds complete.
+- Lite measures 7,925,248 bytes (7.56 MiB), below its 25 MiB CI ceiling.
+- AI measures 9,413,120 bytes (8.98 MiB), below its 35 MiB CI ceiling.
+- Lite smoke tests complete for `doctor`, sample scan, search, and source-backed context generation.
+- CI builds Windows/Linux Lite and AI archives, verifies tag/version agreement, generates SHA-256 files, and runs a pinned RustSec audit.
 
-## Resolved release blockers
+The GitHub-hosted Linux builds and RustSec job are verified by CI after push; they cannot be represented as completed by this local Windows run.
 
-1. The dashboard validates exact loopback hosts, same-origin requests, and browser fetch metadata before returning bootstrap data.
-2. Dashboard tokens use 256 bits of operating-system randomness; dynamic bootstrap values are JSON encoded; restrictive response headers are applied.
-3. JSON bodies, source previews, query depth/results/visits, source discovery, concurrent scans, retained jobs, and optional-model responses are bounded.
-4. Edge rebuilding is transactional and cancellable. Ambiguous overloads are no longer guessed, duplicate qualified names remain distinct, and partial queries are marked incomplete.
-5. Optional model URLs are structurally parsed. Remote HTTP, embedded credentials, queries, redirects, unsafe secret-variable names, source sharing, and oversized prompts/responses are rejected.
-6. Release automation tests locked sources, enforces the binary budget, verifies tag/version agreement, publishes SHA-256 files, pins third-party actions, and receives Dependabot updates.
+## Resource benchmark
 
-## Earlier performance observations
+A release-mode Lite benchmark generated 1,000 small Python files in a fresh temporary project and a fresh data directory:
 
-On synthetic Python projects, initial scans measured 2.15 seconds and 8.53 MiB peak working set for 100 files, 19.34 seconds and 22.02 MiB for 1,000 files, and 95.07 seconds and 63.07 MiB for 5,000 files. An unchanged 5,000-file rescan took 3.60 seconds. The dashboard measured 5.96 MiB at idle.
+| Operation | Time | Peak/size |
+|---|---:|---:|
+| Initial scan | 15.80 s | 15,507,456-byte peak working set (14.79 MiB) |
+| Unchanged rescan | 0.17 s | 8,486,912-byte peak working set (8.09 MiB) |
+| SQLite index | — | 1,019,904 bytes |
+| Idle dashboard | — | 6,225,920-byte working set (5.94 MiB) |
 
-These were single runs on one Windows 11 laptop with 16 GB RAM and predate the latest hardening changes. They do not guarantee memory, CPU, latency, browser use, or index size on another device.
+The temporary benchmark project and index were removed afterward. Values are single runs on one Windows machine and depend on hardware, filesystem, antivirus, code density, and language mix.
+
+## Important hardening changes
+
+1. Scans are generation-based and atomic. Cancellation or edge-rebuild failure rolls back all file/symbol changes.
+2. Edge rebuilding streams 512 references at a time; search, traversal, file expansion, graph output, and context evidence are bounded.
+3. Blocking SQLite/source/Git work runs outside async request tasks behind a two-slot semaphore; scans and model calls have separate one-slot bounds.
+4. Git is invoked without a shell, external diffs, or text conversion and has time/output limits.
+5. Context previews are server-stored for 10 minutes and cryptographically bound to the question, target, revision, evidence, and endpoint. Chat accepts only selected IDs from that exact preview.
+6. The dashboard remains loopback-only, token-protected, same-origin, non-cacheable, and governed by a restrictive CSP.
+7. Lite excludes the HTTP model client. AI requires explicit evidence selection and approval and reports provider token usage when supplied.
 
 ## Remaining external validation
 
-Before claiming support for a new platform or scale, test it there. Real low-memory hardware, large real repositories, long-running/concurrent use, fuzzing, live third-party model providers, Linux distribution compatibility, code signing, and independently reproduced release artifacts have not yet been fully validated. Static call analysis also cannot guarantee coverage of dynamic dispatch, reflection, generated code, or runtime behavior.
+The following remain release/process limitations, not hidden implementation work:
+
+- code signing and publisher reputation;
+- independent reproducible-build verification;
+- fuzzing of parsers, Git output, HTTP APIs, and SQLite migrations;
+- long-duration soak and concurrent workload testing;
+- large real monorepositories and low-memory physical devices;
+- live behavior across specific third-party model providers;
+- compatibility testing across older Linux distributions;
+- independent penetration testing.
+
+Static analysis also cannot guarantee coverage of dynamic dispatch, reflection, generated code, runtime wiring, or all macro behavior.

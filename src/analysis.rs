@@ -1,5 +1,8 @@
-use crate::model::{ImpactNode, Language, ParsedFile, ParsedReference, ParsedSymbol, QueryResult};
-use crate::store::{Store, SymbolRecord};
+use crate::model::{
+    ContextEvidence, ContextPreview, GraphEdge, GraphNode, GraphResult, ImpactNode, Language,
+    ParsedFile, ParsedReference, ParsedSymbol, QueryResult, SearchResult,
+};
+use crate::store::Store;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -22,6 +25,10 @@ const MAX_SOURCE_EXCERPT_BYTES: u64 = 256 * 1024;
 const MAX_DISCOVERED_FILES: usize = 100_000;
 const MAX_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_TARGET_BYTES: usize = 4096;
+const MAX_CONTEXT_EVIDENCE: usize = 12;
+const DEFAULT_CONTEXT_TOKENS: usize = 4_000;
+const MAX_CONTEXT_TOKENS: usize = 8_000;
+const MAX_GRAPH_NODES: usize = 300;
 
 #[derive(Clone)]
 pub struct ScanOptions {
@@ -53,6 +60,7 @@ pub fn scan_project(root: &Path, options: ScanOptions) -> Result<crate::model::P
     let mut store = Store::open(root)?;
     let sources = discover_source_files(store.root(), &options)?;
     let existing = store.existing_files()?;
+    store.begin_scan()?;
     let mut seen = HashSet::new();
     let mut parsed_count = 0usize;
     let mut skipped_count = 0usize;
@@ -137,17 +145,21 @@ pub fn scan_project(root: &Path, options: ScanOptions) -> Result<crate::model::P
         }
     }
     let relationships = if cancelled {
+        store.rollback_scan()?;
         store.count("edges")?
     } else {
         match store.rebuild_edges(options.cancelled.as_deref())? {
-            Some(count) => count,
+            Some(count) => {
+                store.commit_scan()?;
+                count
+            }
             None => {
                 cancelled = true;
+                store.rollback_scan()?;
                 store.count("edges")?
             }
         }
     };
-    store.touch()?;
     store.summary(
         sources.len(),
         parsed_count,
@@ -189,23 +201,31 @@ fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Que
     }
     let requested_depth = depth;
     let depth = depth.min(MAX_QUERY_DEPTH);
-    let symbols = store.symbols()?;
-    let by_id: HashMap<i64, &SymbolRecord> =
-        symbols.iter().map(|symbol| (symbol.id, symbol)).collect();
-    let selected = &target_records[0];
+    let selected = target_records[0].clone();
     let mut seed_ids = vec![selected.id];
+    let mut complete = requested_depth <= MAX_QUERY_DEPTH;
     if selected.kind == "File" {
-        seed_ids.extend(store.file_members(selected.file_id)?);
+        let members = store.file_members(selected.file_id, MAX_RETURNED_NODES + 1)?;
+        if members.len() > MAX_RETURNED_NODES {
+            complete = false;
+        }
+        seed_ids.extend(members.into_iter().take(MAX_RETURNED_NODES));
     }
+    let mut known = HashMap::new();
+    known.insert(selected.id, selected.clone());
     let mut queue = VecDeque::new();
     let mut visited = HashSet::new();
     for seed in seed_ids {
         if visited.insert(seed) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = known.entry(seed) {
+                if let Some(symbol) = store.symbol(seed)? {
+                    entry.insert(symbol);
+                }
+            }
             queue.push_back((seed, 0u32, vec![seed]));
         }
     }
     let mut results = Vec::new();
-    let mut complete = requested_depth <= MAX_QUERY_DEPTH;
     'search: while let Some((current, current_depth, route)) = queue.pop_front() {
         if current_depth >= depth {
             continue;
@@ -231,9 +251,10 @@ fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Que
             if !visited.insert(next) {
                 continue;
             }
-            let Some(symbol) = by_id.get(&next) else {
+            let Some(symbol) = store.symbol(next)? else {
                 continue;
             };
+            known.insert(next, symbol.clone());
             let next_route = if reverse {
                 let mut value = vec![next];
                 value.extend(route.iter().copied());
@@ -245,7 +266,7 @@ fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Que
             };
             let evidence_path = next_route
                 .iter()
-                .filter_map(|id| by_id.get(id).map(|s| s.qualified_name.clone()))
+                .filter_map(|id| known.get(id).map(|s| s.qualified_name.clone()))
                 .collect();
             results.push(ImpactNode {
                 qualified_name: symbol.qualified_name.clone(),
@@ -254,6 +275,7 @@ fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Que
                 path: symbol.path.clone(),
                 line: symbol.line,
                 depth: current_depth + 1,
+                relationship: edge.kind,
                 evidence_path,
             });
             queue.push_back((next, current_depth + 1, next_route));
@@ -268,13 +290,288 @@ fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Que
     };
     Ok(QueryResult {
         mode,
-        target: selected.qualified_name.clone(),
+        target: selected.qualified_name,
         results,
         candidates: vec![],
         complete,
         visited: visited.len(),
         message,
     })
+}
+
+pub fn search(root: &Path, query: &str, limit: usize) -> Result<SearchResult> {
+    let query = query.trim();
+    if query.is_empty() || query.len() > MAX_TARGET_BYTES {
+        anyhow::bail!("search query must contain between 1 and {MAX_TARGET_BYTES} bytes");
+    }
+    let limit = limit.clamp(1, 100);
+    let store = Store::open(root)?;
+    let (records, complete) = store.search_symbols(query, limit)?;
+    Ok(SearchResult {
+        items: Store::candidates(&records),
+        complete,
+    })
+}
+
+pub fn graph(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<GraphResult> {
+    let query = run_query(root, target, depth, reverse)?;
+    if !query.candidates.is_empty() {
+        return Ok(GraphResult {
+            target: query.target,
+            nodes: vec![],
+            edges: vec![],
+            complete: true,
+            message: query.message,
+        });
+    }
+    let store = Store::open(root)?;
+    let selected = store.find_symbols(&query.target)?.into_iter().next();
+    let mut nodes = Vec::new();
+    if let Some(symbol) = selected {
+        nodes.push(GraphNode {
+            id: symbol.qualified_name.clone(),
+            label: symbol.name,
+            kind: symbol.kind,
+            path: symbol.path,
+            line: symbol.line,
+            depth: 0,
+            selected: true,
+        });
+    }
+    let mut seen = nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<HashSet<_>>();
+    for item in query
+        .results
+        .iter()
+        .take(MAX_GRAPH_NODES.saturating_sub(nodes.len()))
+    {
+        if seen.insert(item.qualified_name.clone()) {
+            nodes.push(GraphNode {
+                id: item.qualified_name.clone(),
+                label: item.name.clone(),
+                kind: item.kind.clone(),
+                path: item.path.clone(),
+                line: item.line,
+                depth: item.depth,
+                selected: false,
+            });
+        }
+    }
+    let node_ids = nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut edge_keys = HashSet::new();
+    let mut edges = Vec::new();
+    for item in &query.results {
+        for pair in item.evidence_path.windows(2) {
+            if node_ids.contains(pair[0].as_str()) && node_ids.contains(pair[1].as_str()) {
+                let key = (pair[0].clone(), pair[1].clone());
+                if edge_keys.insert(key.clone()) {
+                    edges.push(GraphEdge {
+                        source: key.0,
+                        target: key.1,
+                        kind: item.relationship.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(GraphResult {
+        target: query.target,
+        nodes,
+        edges,
+        complete: query.complete && query.results.len() <= MAX_GRAPH_NODES,
+        message: query.message,
+    })
+}
+
+pub fn context_preview(
+    root: &Path,
+    question: &str,
+    target: Option<&str>,
+    include_source: bool,
+    budget_tokens: Option<usize>,
+    model_endpoint: Option<String>,
+) -> Result<ContextPreview> {
+    let question = question.trim();
+    if question.is_empty() || question.len() > MAX_TARGET_BYTES {
+        anyhow::bail!("question must contain between 1 and {MAX_TARGET_BYTES} bytes");
+    }
+    let budget_tokens = budget_tokens
+        .unwrap_or(DEFAULT_CONTEXT_TOKENS)
+        .clamp(1_000, MAX_CONTEXT_TOKENS);
+    let store = Store::open(root)?;
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    let mut selection_complete = true;
+    if let Some(target) = target.map(str::trim).filter(|value| !value.is_empty()) {
+        let target_records = store.find_symbols(target)?;
+        if target_records.len() > 4 {
+            selection_complete = false;
+        }
+        for record in target_records.into_iter().take(4) {
+            let selected_id = record.id;
+            if seen.insert(selected_id) {
+                records.push((record, "selected target".to_owned()));
+            }
+            for reverse in [false, true] {
+                let adjacent = store.neighbors(selected_id, reverse, 5)?;
+                if adjacent.len() > 4 {
+                    selection_complete = false;
+                }
+                for edge in adjacent.into_iter().take(4) {
+                    let adjacent_id = if reverse {
+                        edge.source_id
+                    } else {
+                        edge.target_id
+                    };
+                    if !seen.insert(adjacent_id) {
+                        continue;
+                    }
+                    if let Some(symbol) = store.symbol(adjacent_id)? {
+                        let direction = if reverse { "dependant" } else { "dependency" };
+                        records.push((
+                            symbol,
+                            format!(
+                                "direct {} {direction} of selected target",
+                                edge.kind.to_ascii_lowercase()
+                            ),
+                        ));
+                    }
+                    if records.len() >= MAX_CONTEXT_EVIDENCE {
+                        selection_complete = false;
+                        break;
+                    }
+                }
+                if records.len() >= MAX_CONTEXT_EVIDENCE {
+                    break;
+                }
+            }
+            if records.len() >= MAX_CONTEXT_EVIDENCE {
+                break;
+            }
+        }
+    }
+    for term in context_terms(question) {
+        let (matches, search_complete) = store.search_symbols(&term, 4)?;
+        selection_complete &= search_complete;
+        for record in matches {
+            if record.kind != "File" && seen.insert(record.id) {
+                records.push((record, format!("matched question term '{term}'")));
+            }
+            if records.len() >= MAX_CONTEXT_EVIDENCE {
+                selection_complete = false;
+                break;
+            }
+        }
+        if records.len() >= MAX_CONTEXT_EVIDENCE {
+            break;
+        }
+    }
+    let mut estimated_tokens = estimate_tokens(question) + 120;
+    let mut complete = selection_complete;
+    let mut evidence = Vec::new();
+    for (index, (record, relationship)) in records.into_iter().enumerate() {
+        let metadata_tokens =
+            24 + estimate_tokens(&record.qualified_name) + estimate_tokens(&record.path);
+        if estimated_tokens + metadata_tokens >= budget_tokens {
+            complete = false;
+            break;
+        }
+        let mut source = None;
+        let mut item_tokens = metadata_tokens;
+        if include_source {
+            let end_line = record
+                .end_line
+                .saturating_add(1)
+                .min(record.line.saturating_add(80));
+            if let Ok(mut excerpt) =
+                source_excerpt(root, &record.path, record.line as usize, end_line as usize)
+            {
+                let available = budget_tokens.saturating_sub(estimated_tokens + metadata_tokens);
+                let max_chars = available.saturating_mul(4).min(4_000);
+                if excerpt.len() > max_chars {
+                    const MARKER: &str = "
+… excerpt truncated …";
+                    excerpt = truncate_utf8(&excerpt, max_chars.saturating_sub(MARKER.len()));
+                    if max_chars >= MARKER.len() {
+                        excerpt.push_str(MARKER);
+                    }
+                    complete = false;
+                }
+                item_tokens += estimate_tokens(&excerpt);
+                source = Some(excerpt);
+            }
+        }
+        estimated_tokens += item_tokens;
+        evidence.push(ContextEvidence {
+            id: format!("E{}", index + 1),
+            qualified_name: record.qualified_name,
+            kind: record.kind,
+            path: record.path,
+            start_line: record.line,
+            end_line: record.end_line,
+            relationship,
+            source,
+            estimated_tokens: item_tokens,
+        });
+    }
+    let revision = format!("index:{}", store.generation()?);
+    let target = target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let fingerprint =
+        serde_json::to_vec(&(question, &target, &revision, &evidence, &model_endpoint))?;
+    let digest = Sha256::digest(&fingerprint);
+    Ok(ContextPreview {
+        preview_id: hex::encode(&digest[..16]),
+        question: question.to_owned(),
+        target,
+        revision,
+        evidence,
+        estimated_tokens,
+        budget_tokens,
+        complete,
+        model_endpoint,
+    })
+}
+
+fn context_terms(question: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "what", "where", "which", "when", "does", "this", "that", "with", "from", "into", "code",
+        "function", "class", "explain", "show", "find", "could", "would", "about",
+    ];
+    let mut terms = question
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '_' && character != '/' && character != '.'
+        })
+        .map(|term| term.trim_matches(['/', '.']).to_ascii_lowercase())
+        .filter(|term| term.len() >= 3 && !STOP.contains(&term.as_str()))
+        .collect::<Vec<_>>();
+    terms.sort();
+    terms.dedup();
+    terms.sort_by_key(|term| std::cmp::Reverse(term.len()));
+    terms.truncate(8);
+    terms
+}
+
+fn estimate_tokens(value: &str) -> usize {
+    value.chars().count().div_ceil(4)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 pub fn source_excerpt(
     root: &Path,
@@ -826,6 +1123,69 @@ mod tests {
             .any(|node| node.qualified_name.ends_with("::caller")));
     }
 
+    #[test]
+    fn search_graph_and_context_stay_bounded() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("service.py"),
+            "def authenticate(user):\n    return user is not None\n\ndef login(user):\n    return authenticate(user)\n",
+        )
+        .unwrap();
+        scan_project(temp.path(), ScanOptions::default()).unwrap();
+
+        let matches = search(temp.path(), "auth", 10).unwrap();
+        assert!(matches
+            .items
+            .iter()
+            .any(|item| item.qualified_name.ends_with("::authenticate")));
+
+        let result = graph(temp.path(), "authenticate", 3, true).unwrap();
+        assert!(result.nodes.iter().any(|node| node.selected));
+        assert!(result.nodes.iter().any(|node| node.id.ends_with("::login")));
+
+        let preview = context_preview(
+            temp.path(),
+            "How does authenticate affect login?",
+            Some("authenticate"),
+            true,
+            Some(1_000),
+            None,
+        )
+        .unwrap();
+        assert!(!preview.evidence.is_empty());
+        assert!(preview.estimated_tokens <= preview.budget_tokens);
+        assert!(preview.evidence.iter().any(|item| item.source.is_some()));
+        assert!(preview
+            .evidence
+            .iter()
+            .any(|item| item.qualified_name.ends_with("::login")));
+    }
+
+    #[test]
+    fn cancelled_scan_preserves_previous_generation() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("app.py");
+        fs::write(&path, "def stable():\n    return 1\n").unwrap();
+        let initial = scan_project(temp.path(), ScanOptions::default()).unwrap();
+        fs::write(&path, "def replacement():\n    return 2\n").unwrap();
+
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let summary = scan_project(
+            temp.path(),
+            ScanOptions {
+                cancelled: Some(cancelled),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(summary.cancelled);
+        assert_eq!(summary.generation, initial.generation);
+        assert!(!search(temp.path(), "stable", 10).unwrap().items.is_empty());
+        assert!(search(temp.path(), "replacement", 10)
+            .unwrap()
+            .items
+            .is_empty());
+    }
     #[test]
     fn keeps_overloads_distinct_and_ambiguous() {
         let temp = tempdir().unwrap();

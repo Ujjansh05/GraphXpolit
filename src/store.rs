@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileRecord {
@@ -26,13 +26,14 @@ pub(crate) struct SymbolRecord {
     pub kind: String,
     pub path: String,
     pub line: u32,
+    pub end_line: u32,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeRecord {
     pub source_id: i64,
     pub target_id: i64,
-    pub _kind: String,
+    pub kind: String,
 }
 
 pub struct Store {
@@ -94,7 +95,8 @@ impl Store {
                 root TEXT NOT NULL UNIQUE,
                 schema_version INTEGER NOT NULL,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                generation INTEGER NOT NULL DEFAULT 0
               );
               CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY,
@@ -105,6 +107,7 @@ impl Store {
                 language TEXT NOT NULL,
                 UNIQUE(project_id, rel_path)
               );
+              CREATE INDEX IF NOT EXISTS files_path_idx ON files(project_id, rel_path);
               CREATE TABLE IF NOT EXISTS symbols (
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -117,6 +120,7 @@ impl Store {
                 UNIQUE(project_id, qualified_name)
               );
               CREATE INDEX IF NOT EXISTS symbols_name_idx ON symbols(project_id, name);
+              CREATE INDEX IF NOT EXISTS symbols_qualified_idx ON symbols(project_id, qualified_name);
               CREATE INDEX IF NOT EXISTS symbols_file_idx ON symbols(file_id);
               CREATE TABLE IF NOT EXISTS symbol_references (
                 id INTEGER PRIMARY KEY,
@@ -151,6 +155,24 @@ impl Store {
                 severity TEXT NOT NULL DEFAULT 'warning'
               );",
         )?;
+        let has_generation = {
+            let mut statement = conn.prepare("PRAGMA table_info(projects)")?;
+            let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for column in columns {
+                if column? == "generation" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_generation {
+            conn.execute(
+                "ALTER TABLE projects ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         let root_string = root.to_string_lossy();
         conn.execute(
             "INSERT INTO projects(root, schema_version) VALUES (?1, ?2)
@@ -213,7 +235,7 @@ impl Store {
         language: &str,
         parsed: &ParsedFile,
     ) -> Result<()> {
-        let transaction = self.conn.transaction()?;
+        let transaction = self.conn.savepoint()?;
         transaction.execute(
             "DELETE FROM files WHERE project_id=?1 AND rel_path=?2",
             params![self.project_id, rel_path],
@@ -270,152 +292,185 @@ impl Store {
             return Ok(None);
         }
 
-        let symbols = self.symbols()?;
-        let mut by_name: HashMap<String, Vec<&SymbolRecord>> = HashMap::new();
+        const EDGE_BATCH: i64 = 512;
+        let transaction = self.conn.savepoint()?;
+        transaction.execute("DELETE FROM edges WHERE project_id=?1", [self.project_id])?;
+        let mut edges = transaction.execute(
+            "INSERT OR IGNORE INTO edges(project_id, source_id, target_id, kind)
+             SELECT ?1, file_node.id, member.id, 'CONTAINS'
+             FROM symbols member
+             JOIN symbols file_node
+               ON file_node.project_id=member.project_id
+              AND file_node.file_id=member.file_id
+              AND file_node.kind='File'
+             WHERE member.project_id=?1 AND member.kind!='File'",
+            [self.project_id],
+        )?;
+
         let mut file_nodes = HashMap::new();
         let mut file_modules: HashMap<String, i64> = HashMap::new();
-        for symbol in &symbols {
-            if symbol.kind == "File" {
-                file_nodes.insert(symbol.file_id, symbol.id);
-                for key in module_keys(&symbol.path) {
-                    file_modules.entry(key).or_insert(symbol.id);
+        {
+            let mut statement = transaction.prepare(
+                "SELECT s.file_id, s.id, f.rel_path
+                 FROM symbols s JOIN files f ON f.id=s.file_id
+                 WHERE s.project_id=?1 AND s.kind='File'",
+            )?;
+            let rows = statement.query_map([self.project_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                if cancellation_requested(cancelled) {
+                    return Ok(None);
                 }
-            } else {
-                by_name.entry(symbol.name.clone()).or_default().push(symbol);
+                let (file_id, symbol_id, path) = row?;
+                file_nodes.insert(file_id, symbol_id);
+                for key in module_keys(&path) {
+                    file_modules.entry(key).or_insert(symbol_id);
+                }
             }
         }
 
-        let transaction = self.conn.transaction()?;
-        transaction.execute("DELETE FROM edges WHERE project_id=?1", [self.project_id])?;
-        let mut edges = 0usize;
-        for symbol in &symbols {
-            if cancellation_requested(cancelled) {
-                return Ok(None);
+        {
+            let mut same_file_lookup = transaction.prepare(
+                "SELECT id FROM symbols
+                 WHERE project_id=?1 AND kind!='File' AND name=?2 AND file_id=?3
+                 ORDER BY id LIMIT 2",
+            )?;
+            let mut global_lookup = transaction.prepare(
+                "SELECT id FROM symbols
+                 WHERE project_id=?1 AND kind!='File' AND name=?2
+                 ORDER BY id LIMIT 2",
+            )?;
+            let mut cursor = 0i64;
+            loop {
+                let batch = {
+                    let mut statement = transaction.prepare(
+                        "SELECT r.rowid, r.source_symbol_id, s.file_id, r.raw_target, r.line
+                         FROM symbol_references r
+                         JOIN symbols s ON s.id=r.source_symbol_id
+                         WHERE r.project_id=?1 AND r.rowid>?2
+                         ORDER BY r.rowid LIMIT ?3",
+                    )?;
+                    let rows = statement.query_map(
+                        params![self.project_id, cursor, EDGE_BATCH],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, u32>(4)?,
+                            ))
+                        },
+                    )?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                if batch.is_empty() {
+                    break;
+                }
+                for (row_id, source_id, source_file_id, raw_target, line) in batch {
+                    cursor = row_id;
+                    if cancellation_requested(cancelled) {
+                        return Ok(None);
+                    }
+                    let name = terminal_name(&raw_target);
+                    let same_file = same_file_lookup
+                        .query_map(params![self.project_id, name, source_file_id], |row| {
+                            row.get::<_, i64>(0)
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let target_id = match same_file.as_slice() {
+                        [target] => Some(*target),
+                        [] => {
+                            let global = global_lookup
+                                .query_map(params![self.project_id, name], |row| {
+                                    row.get::<_, i64>(0)
+                                })?
+                                .collect::<rusqlite::Result<Vec<_>>>()?;
+                            match global.as_slice() {
+                                [target] => Some(*target),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(target_id) = target_id {
+                        edges += transaction.execute(
+                            "INSERT OR IGNORE INTO edges(project_id, source_id, target_id, kind, evidence_line)
+                             VALUES (?1, ?2, ?3, 'CALLS', ?4)",
+                            params![self.project_id, source_id, target_id, line],
+                        )?;
+                    }
+                }
             }
-            if symbol.kind != "File" {
-                if let Some(file_node) = file_nodes.get(&symbol.file_id) {
+        }
+
+        let mut cursor = 0i64;
+        loop {
+            let batch = {
+                let mut statement = transaction.prepare(
+                    "SELECT rowid, source_file_id, raw_target, line
+                     FROM imports
+                     WHERE project_id=?1 AND rowid>?2
+                     ORDER BY rowid LIMIT ?3",
+                )?;
+                let rows =
+                    statement.query_map(params![self.project_id, cursor, EDGE_BATCH], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, u32>(3)?,
+                        ))
+                    })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if batch.is_empty() {
+                break;
+            }
+            for (row_id, source_file_id, raw_target, line) in batch {
+                cursor = row_id;
+                if cancellation_requested(cancelled) {
+                    return Ok(None);
+                }
+                let Some(source_id) = file_nodes.get(&source_file_id) else {
+                    continue;
+                };
+                let module = import_module_name(&raw_target);
+                let target = file_modules.get(&module).copied().or_else(|| {
+                    module
+                        .rsplit('.')
+                        .next()
+                        .and_then(|part| file_modules.get(part).copied())
+                });
+                if let Some(target_id) = target.filter(|target| *target != *source_id) {
                     edges += transaction.execute(
-                        "INSERT OR IGNORE INTO edges(project_id, source_id, target_id, kind) VALUES (?1, ?2, ?3, 'CONTAINS')",
-                        params![self.project_id, file_node, symbol.id],
+                        "INSERT OR IGNORE INTO edges(project_id, source_id, target_id, kind, evidence_line)
+                         VALUES (?1, ?2, ?3, 'IMPORTS', ?4)",
+                        params![self.project_id, source_id, target_id, line],
                     )?;
                 }
-            }
-        }
-
-        let mut statement = transaction.prepare(
-            "SELECT source_symbol_id, raw_target, line FROM symbol_references WHERE project_id=?1",
-        )?;
-        let rows = statement.query_map([self.project_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, u32>(2)?,
-            ))
-        })?;
-        let mut references = Vec::new();
-        for row in rows {
-            if cancellation_requested(cancelled) {
-                return Ok(None);
-            }
-            references.push(row?);
-        }
-        drop(statement);
-
-        let by_id: HashMap<i64, &SymbolRecord> =
-            symbols.iter().map(|symbol| (symbol.id, symbol)).collect();
-        for (source_id, raw_target, line) in references {
-            if cancellation_requested(cancelled) {
-                return Ok(None);
-            }
-            let Some(source) = by_id.get(&source_id) else {
-                continue;
-            };
-            let name = terminal_name(&raw_target);
-            let Some(candidates) = by_name.get(&name) else {
-                continue;
-            };
-            if let Some(target) = select_unambiguous_target(candidates, source.file_id) {
-                edges += transaction.execute(
-                    "INSERT OR IGNORE INTO edges(project_id, source_id, target_id, kind, evidence_line) VALUES (?1, ?2, ?3, 'CALLS', ?4)",
-                    params![self.project_id, source_id, target.id, line],
-                )?;
-            }
-        }
-
-        let mut imports = transaction
-            .prepare("SELECT source_file_id, raw_target, line FROM imports WHERE project_id=?1")?;
-        let rows = imports.query_map([self.project_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, u32>(2)?,
-            ))
-        })?;
-        let mut import_rows = Vec::new();
-        for row in rows {
-            if cancellation_requested(cancelled) {
-                return Ok(None);
-            }
-            import_rows.push(row?);
-        }
-        drop(imports);
-
-        for (source_file_id, raw_target, line) in import_rows {
-            if cancellation_requested(cancelled) {
-                return Ok(None);
-            }
-            let Some(source_id) = file_nodes.get(&source_file_id) else {
-                continue;
-            };
-            let module = import_module_name(&raw_target);
-            let target = file_modules.get(&module).copied().or_else(|| {
-                module
-                    .rsplit('.')
-                    .next()
-                    .and_then(|part| file_modules.get(part).copied())
-            });
-            if let Some(target_id) = target.filter(|target| *target != *source_id) {
-                edges += transaction.execute(
-                    "INSERT OR IGNORE INTO edges(project_id, source_id, target_id, kind, evidence_line) VALUES (?1, ?2, ?3, 'IMPORTS', ?4)",
-                    params![self.project_id, source_id, target_id, line],
-                )?;
             }
         }
 
         transaction.commit()?;
         Ok(Some(edges))
     }
-    pub(crate) fn symbols(&self) -> Result<Vec<SymbolRecord>> {
-        let mut statement = self.conn.prepare(
-            "SELECT s.id, s.file_id, s.name, s.qualified_name, s.kind, f.rel_path, s.start_line
-             FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.project_id=?1",
-        )?;
-        let rows = statement.query_map([self.project_id], |row| {
-            Ok(SymbolRecord {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                name: row.get(2)?,
-                qualified_name: row.get(3)?,
-                kind: row.get(4)?,
-                path: row.get(5)?,
-                line: row.get(6)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    }
-
     pub(crate) fn find_symbols(&self, target: &str) -> Result<Vec<SymbolRecord>> {
         let exact = self.conn.prepare(
-            "SELECT s.id, s.file_id, s.name, s.qualified_name, s.kind, f.rel_path, s.start_line FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.project_id=?1 AND s.qualified_name=?2",
+            "SELECT s.id, s.file_id, s.name, s.qualified_name, s.kind, f.rel_path, s.start_line, s.end_line FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.project_id=?1 AND s.qualified_name=?2",
         )?.query_map(params![self.project_id, target], |row| {
-            Ok(SymbolRecord { id: row.get(0)?, file_id: row.get(1)?, name: row.get(2)?, qualified_name: row.get(3)?, kind: row.get(4)?, path: row.get(5)?, line: row.get(6)? })
+            Ok(SymbolRecord { id: row.get(0)?, file_id: row.get(1)?, name: row.get(2)?, qualified_name: row.get(3)?, kind: row.get(4)?, path: row.get(5)?, line: row.get(6)?, end_line: row.get(7)? })
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         if !exact.is_empty() {
             return Ok(exact);
         }
         let mut statement = self.conn.prepare(
-            "SELECT s.id, s.file_id, s.name, s.qualified_name, s.kind, f.rel_path, s.start_line FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.project_id=?1 AND (s.name=?2 OR s.qualified_name LIKE ?3)",
+            "SELECT s.id, s.file_id, s.name, s.qualified_name, s.kind, f.rel_path, s.start_line, s.end_line FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.project_id=?1 AND (s.name=?2 OR s.qualified_name LIKE ?3)",
         )?;
         let query = format!("%::{target}");
         let rows = statement.query_map(params![self.project_id, target, query], |row| {
@@ -427,17 +482,20 @@ impl Store {
                 kind: row.get(4)?,
                 path: row.get(5)?,
                 line: row.get(6)?,
+                end_line: row.get(7)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub(crate) fn file_members(&self, file_id: i64) -> Result<Vec<i64>> {
+    pub(crate) fn file_members(&self, file_id: i64, limit: usize) -> Result<Vec<i64>> {
         let mut statement = self.conn.prepare(
-            "SELECT id FROM symbols WHERE project_id=?1 AND file_id=?2 AND kind != 'File'",
+            "SELECT id FROM symbols WHERE project_id=?1 AND file_id=?2 AND kind != 'File' ORDER BY id LIMIT ?3",
         )?;
-        let rows = statement.query_map(params![self.project_id, file_id], |row| row.get(0))?;
+        let rows = statement.query_map(params![self.project_id, file_id, limit as i64], |row| {
+            row.get(0)
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -458,7 +516,7 @@ impl Store {
             Ok(EdgeRecord {
                 source_id: row.get(0)?,
                 target_id: row.get(1)?,
-                _kind: row.get(2)?,
+                kind: row.get(2)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -475,14 +533,106 @@ impl Store {
             .query_row(&sql, [self.project_id], |row| row.get::<_, i64>(0))? as usize)
     }
 
-    pub(crate) fn touch(&self) -> Result<()> {
-        self.conn.execute(
-            "UPDATE projects SET updated_at=unixepoch() WHERE id=?1",
-            [self.project_id],
-        )?;
+    pub(crate) fn begin_scan(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
         Ok(())
     }
 
+    pub(crate) fn commit_scan(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE projects SET updated_at=unixepoch(), generation=generation+1 WHERE id=?1",
+            [self.project_id],
+        )?;
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    pub(crate) fn rollback_scan(&self) -> Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
+    pub(crate) fn generation(&self) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT generation FROM projects WHERE id=?1",
+            [self.project_id],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    pub(crate) fn symbol(&self, id: i64) -> Result<Option<SymbolRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT s.id, s.file_id, s.name, s.qualified_name, s.kind, f.rel_path, s.start_line, s.end_line FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.project_id=?1 AND s.id=?2",
+        )?;
+        let mut rows = statement.query(params![self.project_id, id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(SymbolRecord {
+            id: row.get(0)?,
+            file_id: row.get(1)?,
+            name: row.get(2)?,
+            qualified_name: row.get(3)?,
+            kind: row.get(4)?,
+            path: row.get(5)?,
+            line: row.get(6)?,
+            end_line: row.get(7)?,
+        }))
+    }
+
+    pub(crate) fn symbols_for_path(&self, path: &str, limit: usize) -> Result<Vec<SymbolRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT s.id, s.file_id, s.name, s.qualified_name, s.kind, f.rel_path, s.start_line, s.end_line FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.project_id=?1 AND f.rel_path=?2 ORDER BY s.start_line LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![self.project_id, path, limit as i64], |row| {
+            Ok(SymbolRecord {
+                id: row.get(0)?,
+                file_id: row.get(1)?,
+                name: row.get(2)?,
+                qualified_name: row.get(3)?,
+                kind: row.get(4)?,
+                path: row.get(5)?,
+                line: row.get(6)?,
+                end_line: row.get(7)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn search_symbols(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<(Vec<SymbolRecord>, bool)> {
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let mut statement = self.conn.prepare(
+            "SELECT s.id, s.file_id, s.name, s.qualified_name, s.kind, f.rel_path, s.start_line, s.end_line FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.project_id=?1 AND (s.name LIKE ?2 ESCAPE '\\' OR s.qualified_name LIKE ?2 ESCAPE '\\' OR f.rel_path LIKE ?2 ESCAPE '\\') ORDER BY CASE WHEN lower(s.name)=lower(?3) THEN 0 WHEN lower(s.name) LIKE lower(?3 || '%') THEN 1 ELSE 2 END, length(s.qualified_name), s.qualified_name LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![self.project_id, pattern, query, (limit + 1) as i64],
+            |row| {
+                Ok(SymbolRecord {
+                    id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    name: row.get(2)?,
+                    qualified_name: row.get(3)?,
+                    kind: row.get(4)?,
+                    path: row.get(5)?,
+                    line: row.get(6)?,
+                    end_line: row.get(7)?,
+                })
+            },
+        )?;
+        let mut records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let complete = records.len() <= limit;
+        records.truncate(limit);
+        Ok((records, complete))
+    }
     pub(crate) fn candidates(records: &[SymbolRecord]) -> Vec<Candidate> {
         records
             .iter()
@@ -513,6 +663,7 @@ impl Store {
             relationships,
             diagnostics: self.count("diagnostics")?,
             cancelled,
+            generation: self.generation()?,
         })
     }
 }
@@ -531,21 +682,6 @@ fn cancellation_requested(cancelled: Option<&AtomicBool>) -> bool {
     cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
-fn select_unambiguous_target<'a>(
-    candidates: &'a [&SymbolRecord],
-    file_id: i64,
-) -> Option<&'a SymbolRecord> {
-    let same_file = candidates
-        .iter()
-        .copied()
-        .filter(|candidate| candidate.file_id == file_id)
-        .collect::<Vec<_>>();
-    match same_file.as_slice() {
-        [candidate] => Some(*candidate),
-        [] if candidates.len() == 1 => Some(candidates[0]),
-        _ => None,
-    }
-}
 fn module_keys(path: &str) -> Vec<String> {
     let normalized = path.replace('\\', "/");
     let stem = normalized

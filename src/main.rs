@@ -2,9 +2,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use graphxploit::{
     ai::{self, ModelConfig, Provider},
-    dependencies, impact, scan_project, web, ScanOptions,
+    branch_changes, context_preview, dependencies, impact, scan_project, search, web,
+    working_changes, ScanOptions,
 };
-use std::path::PathBuf;
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+    process::Command as ProcessCommand,
+};
 
 #[derive(Parser)]
 #[command(
@@ -40,6 +45,50 @@ enum Command {
         target: String,
         #[arg(long, default_value_t = 5)]
         depth: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search indexed symbols and files without loading the full graph.
+    Search {
+        path: PathBuf,
+        query: String,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build compact local evidence for a codebase question without calling a model.
+    Context {
+        path: PathBuf,
+        question: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        include_source: bool,
+        #[arg(long, default_value_t = 4_000)]
+        budget: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview and approve compact evidence before asking a configured model.
+    Ask {
+        path: PathBuf,
+        question: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value_t = 4_000)]
+        budget: usize,
+        /// Approve all displayed evidence without an interactive prompt.
+        #[arg(long)]
+        approve: bool,
+    },
+    /// Analyze tracked Git changes and their indexed impact.
+    Diff {
+        path: PathBuf,
+        #[arg(long)]
+        working: bool,
+        #[arg(long)]
+        base: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -164,6 +213,122 @@ async fn main() -> Result<()> {
             depth,
             json,
         }) => print_result(&dependencies(&path, &target, depth)?, json)?,
+        Some(Command::Search {
+            path,
+            query,
+            limit,
+            json,
+        }) => {
+            let result = search(&path, &query, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                for item in result.items {
+                    println!(
+                        "{}:{}  {} ({})",
+                        item.path, item.line, item.qualified_name, item.kind
+                    );
+                }
+                if !result.complete {
+                    println!("More matches exist; narrow the query.");
+                }
+            }
+        }
+        Some(Command::Context {
+            path,
+            question,
+            target,
+            include_source,
+            budget,
+            json,
+        }) => {
+            let preview = context_preview(
+                &path,
+                &question,
+                target.as_deref(),
+                include_source,
+                Some(budget),
+                ai::configured_endpoint(),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&preview)?);
+            } else {
+                print_context_preview(&preview);
+            }
+        }
+        Some(Command::Ask {
+            path,
+            question,
+            target,
+            budget,
+            approve,
+        }) => {
+            let preview = context_preview(
+                &path,
+                &question,
+                target.as_deref(),
+                true,
+                Some(budget),
+                ai::configured_endpoint(),
+            )?;
+            print_context_preview(&preview);
+            if !approve && !confirm_send()? {
+                println!("Model request cancelled; no source was sent.");
+                return Ok(());
+            }
+            let selected = preview
+                .evidence
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            let answer = ai::ask_preview(&preview, &selected).await?;
+            println!("\n{}", answer.answer);
+            if let Some(warning) = answer.citation_warning {
+                println!("\nCitation warning: {warning}");
+            }
+            println!(
+                "\nEstimated input: {} tokens",
+                answer.estimated_input_tokens
+            );
+        }
+        Some(Command::Diff {
+            path,
+            working,
+            base,
+            json,
+        }) => {
+            if working && base.is_some() {
+                anyhow::bail!("choose either --working or --base, not both");
+            }
+            let result = if let Some(base) = base {
+                branch_changes(&path, &base)?
+            } else {
+                working_changes(&path)?
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} changes: {} -> {}",
+                    result.mode, result.base_revision, result.head_revision
+                );
+                if let Some(message) = result.message {
+                    println!("{message}");
+                }
+                for change in result.changes {
+                    println!(
+                        "  {}  {}:{}  {}",
+                        change.status, change.path, change.line, change.qualified_name
+                    );
+                    for affected in change.affected.iter().take(5) {
+                        println!(
+                            "      affects {}:{}  {}",
+                            affected.path, affected.line, affected.qualified_name
+                        );
+                    }
+                }
+            }
+        }
         Some(Command::Explain {
             path,
             target,
@@ -194,7 +359,7 @@ async fn main() -> Result<()> {
                 }
                 ModelCommand::Status => match ai::load_config() {
                     Ok(config) => println!(
-                        "Configured {:?} model '{}' at {}. Source sharing: disabled.",
+                        "Configured {:?} model '{}' at {}. Automatic source sharing is disabled; source-backed chat always requires preview approval.",
                         config.provider, config.model, config.endpoint
                     ),
                     Err(error) => println!("No usable model configuration: {error}"),
@@ -207,11 +372,64 @@ async fn main() -> Result<()> {
             println!("Storage: {}", graphxploit::store::app_data_dir()?.display());
             println!("Supported parsers: Python, JavaScript/TypeScript/TSX, Go, Rust, Java");
             println!("No Docker, TigerGraph, Ollama, Node.js, or GPU is required.");
-            println!("Optional existing-model support: build with `--features ai`.");
+            println!(
+                "Edition: {}",
+                if cfg!(feature = "ai") { "AI" } else { "Lite" }
+            );
+            let git = ProcessCommand::new("git")
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            println!(
+                "Git change analysis: {}",
+                git.as_deref().unwrap_or("unavailable")
+            );
         }
         None => web::serve(None, 0)
             .await
             .context("failed to start local dashboard")?,
     }
     Ok(())
+}
+fn print_context_preview(preview: &graphxploit::model::ContextPreview) {
+    println!(
+        "Context preview {}: approximately {} / {} tokens, revision {}",
+        preview.preview_id, preview.estimated_tokens, preview.budget_tokens, preview.revision
+    );
+    if let Some(endpoint) = &preview.model_endpoint {
+        println!("Destination: {endpoint}");
+    } else {
+        println!("Destination: no model configured");
+    }
+    for item in &preview.evidence {
+        println!(
+            "\n[{}] {}:{}-{}  {} ({})\nReason: {}",
+            item.id,
+            item.path,
+            item.start_line,
+            item.end_line,
+            item.qualified_name,
+            item.kind,
+            item.relationship
+        );
+        if let Some(source) = &item.source {
+            println!("{source}");
+        }
+    }
+    if !preview.complete {
+        println!("\nContext reached its budget; additional evidence was omitted or truncated.");
+    }
+}
+
+fn confirm_send() -> Result<bool> {
+    print!("\nSend the displayed evidence to the configured model? [y/N] ");
+    io::stdout().flush()?;
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+    Ok(matches!(
+        response.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
