@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use graphxploit::{
+    agent::{self, AgentOptions},
     ai::{self, ModelConfig, Provider},
     branch_changes, context_preview, dependencies, impact, scan_project, search, web,
     working_changes, ScanOptions,
 };
 use std::{
+    env,
     io::{self, Write},
     path::PathBuf,
     process::Command as ProcessCommand,
@@ -15,9 +17,18 @@ use std::{
 #[command(
     name = "graphxploit",
     version,
-    about = "Local code impact analysis. No Docker, database server, or model download required."
+    about = "Local code impact analysis and approval-based code agent."
 )]
 struct Cli {
+    /// Use this workspace for interactive and short commands.
+    #[arg(short = 'C', long, global = true, default_value = ".")]
+    cwd: PathBuf,
+    /// Skip the incremental startup scan.
+    #[arg(long, global = true)]
+    no_scan: bool,
+    /// Maximum local context sent to a configured model.
+    #[arg(long, global = true, default_value_t = 4_000)]
+    budget: usize,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -102,6 +113,7 @@ enum Command {
         question: Option<String>,
     },
     /// Configure or inspect an optional existing model endpoint. API keys stay in environment variables.
+    #[command(alias = "m")]
     Model {
         #[command(subcommand)]
         command: ModelCommand,
@@ -112,6 +124,50 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         port: u16,
     },
+    /// Run one agent request and emit normal text or NDJSON events.
+    Run {
+        #[arg(long)]
+        json: bool,
+        #[arg(required = true, trailing_var_arg = true)]
+        prompt: Vec<String>,
+    },
+    /// Scan the current workspace.
+    Ix {
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Find symbols in the current workspace.
+    F {
+        query: String,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
+    /// Show impact in the current workspace.
+    I {
+        target: String,
+        #[arg(long, default_value_t = 5)]
+        depth: u32,
+    },
+    /// Show dependencies in the current workspace.
+    D {
+        target: String,
+        #[arg(long, default_value_t = 5)]
+        depth: u32,
+    },
+    /// Show Git change impact in the current workspace.
+    Ch { base: Option<String> },
+    /// Ask once about the current workspace.
+    Q {
+        #[arg(required = true, trailing_var_arg = true)]
+        prompt: Vec<String>,
+    },
+    /// Start the dashboard for the current workspace.
+    Ui {
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
+    /// Run lightweight environment diagnostics.
+    Check,
     /// Print environment and storage diagnostics.
     Doctor,
 }
@@ -180,9 +236,95 @@ fn print_result(result: &graphxploit::QueryResult, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn direct_agent_prompt() -> Result<Option<(AgentOptions, String)>> {
+    const COMMANDS: &[&str] = &[
+        "scan",
+        "impact",
+        "dependencies",
+        "search",
+        "context",
+        "ask",
+        "diff",
+        "explain",
+        "model",
+        "m",
+        "serve",
+        "run",
+        "ix",
+        "f",
+        "i",
+        "d",
+        "ch",
+        "q",
+        "ui",
+        "check",
+        "doctor",
+        "help",
+    ];
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
+        return Ok(None);
+    }
+    let mut root = PathBuf::from(".");
+    let mut budget = 4_000usize;
+    let mut no_scan = false;
+    let mut prompt = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-C" | "--cwd" => {
+                index += 1;
+                root = PathBuf::from(
+                    args.get(index)
+                        .context("missing workspace after -C/--cwd")?,
+                );
+            }
+            "--budget" => {
+                index += 1;
+                budget = args
+                    .get(index)
+                    .context("missing value after --budget")?
+                    .parse()
+                    .context("budget must be a number")?;
+            }
+            "--no-scan" => no_scan = true,
+            "-h" | "--help" | "-V" | "--version" => return Ok(None),
+            value if prompt.is_empty() && COMMANDS.contains(&value) => return Ok(None),
+            value => prompt.push(value.to_owned()),
+        }
+        index += 1;
+    }
+    if prompt.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((
+        AgentOptions {
+            root,
+            no_scan,
+            budget,
+            json: false,
+        },
+        prompt.join(" "),
+    )))
+}
 #[tokio::main]
 async fn main() -> Result<()> {
-    match Cli::parse().command {
+    if let Some((options, prompt)) = direct_agent_prompt()? {
+        agent::one_shot(options, prompt).await?;
+        return Ok(());
+    }
+    let cli = Cli::parse();
+    let options = || AgentOptions {
+        root: cli.cwd.clone(),
+        no_scan: cli.no_scan,
+        budget: cli.budget,
+        json: false,
+    };
+    if cli.command.is_none() {
+        agent::interactive(options()).await?;
+        return Ok(());
+    }
+    match cli.command {
         Some(Command::Scan { path, verify }) => {
             let summary = scan_project(
                 &path,
@@ -353,6 +495,7 @@ async fn main() -> Result<()> {
                         model,
                         api_key_env,
                         send_source: false,
+                        tool_protocol: ai::ToolProtocol::Auto,
                     };
                     ai::save_config(&config)?;
                     println!("Saved {} model configuration at {}. API keys are never stored by GraphXploit.", match config.provider { Provider::Ollama => "Ollama", Provider::Openai => "OpenAI-compatible" }, ai::config_path()?.display());
@@ -367,6 +510,32 @@ async fn main() -> Result<()> {
             }
         }
         Some(Command::Serve { path, port }) => web::serve(path, port).await?,
+        Some(Command::Run { json, prompt }) => {
+            let mut value = options();
+            value.json = json;
+            agent::one_shot(value, prompt.join(" ")).await?;
+        }
+        Some(Command::Ix { verify }) => {
+            let summary = scan_project(&cli.cwd, ScanOptions { verify, ..Default::default() })?;
+            println!("{} files · {} parsed · {} unchanged · {} symbols · generation {}", summary.files_seen, summary.files_parsed, summary.files_skipped, summary.symbols, summary.generation);
+        }
+        Some(Command::F { query, limit }) => {
+            let result = search(&cli.cwd, &query, limit)?;
+            for item in result.items { println!("{}:{}  {} ({})", item.path, item.line, item.qualified_name, item.kind); }
+        }
+        Some(Command::I { target, depth }) => print_result(&impact(&cli.cwd, &target, depth)?, false)?,
+        Some(Command::D { target, depth }) => print_result(&dependencies(&cli.cwd, &target, depth)?, false)?,
+        Some(Command::Ch { base }) => {
+            let result = if let Some(base) = base { branch_changes(&cli.cwd, &base)? } else { working_changes(&cli.cwd)? };
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Some(Command::Q { prompt }) => agent::one_shot(options(), prompt.join(" ")).await?,
+        Some(Command::Ui { port }) => web::serve(Some(cli.cwd.clone()), port).await?,
+        Some(Command::Check) => {
+            println!("GraphXploit {} · {} edition", env!("CARGO_PKG_VERSION"), if cfg!(feature = "ai") { "AI" } else { "Lite" });
+            println!("Workspace: {}", cli.cwd.display());
+            println!("Storage: {}", graphxploit::store::app_data_dir()?.display());
+        },
         Some(Command::Doctor) => {
             println!("GraphXploit {}", env!("CARGO_PKG_VERSION"));
             println!("Storage: {}", graphxploit::store::app_data_dir()?.display());
@@ -387,9 +556,7 @@ async fn main() -> Result<()> {
                 git.as_deref().unwrap_or("unavailable")
             );
         }
-        None => web::serve(None, 0)
-            .await
-            .context("failed to start local dashboard")?,
+        None => unreachable!(),
     }
     Ok(())
 }

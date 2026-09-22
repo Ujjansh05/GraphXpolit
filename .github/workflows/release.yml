@@ -20,6 +20,7 @@ jobs:
             edition: lite
             feature_args: ""
             binary: target/release/graphxploit.exe
+            shim: gx.cmd
             archive: graphxploit-windows-x86_64.zip
             budget_mb: 25
           - os: windows-latest
@@ -27,6 +28,7 @@ jobs:
             edition: ai
             feature_args: "--features ai"
             binary: target/release/graphxploit.exe
+            shim: gx.cmd
             archive: graphxploit-windows-x86_64-ai.zip
             budget_mb: 35
           - os: ubuntu-latest
@@ -34,6 +36,7 @@ jobs:
             edition: lite
             feature_args: ""
             binary: target/release/graphxploit
+            shim: gx
             archive: graphxploit-linux-x86_64.zip
             budget_mb: 25
           - os: ubuntu-latest
@@ -41,6 +44,7 @@ jobs:
             edition: ai
             feature_args: "--features ai"
             binary: target/release/graphxploit
+            shim: gx
             archive: graphxploit-linux-x86_64-ai.zip
             budget_mb: 35
     steps:
@@ -78,7 +82,7 @@ jobs:
             throw "Release binary exceeds the ${{ matrix.budget_mb }} MiB budget."
           }
           $archive = '${{ matrix.archive }}'
-          Compress-Archive -LiteralPath $binary -DestinationPath $archive
+          Compress-Archive -LiteralPath @($binary, '${{ matrix.shim }}') -DestinationPath $archive
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $archive" | Set-Content "$archive.sha256" -NoNewline
       - name: Upload release assets

@@ -3,6 +3,7 @@
 //! The engine never runs code from an indexed project. It stores compact symbol
 //! and relationship metadata in a per-project SQLite database.
 
+pub mod agent;
 pub mod ai;
 pub mod analysis;
 pub mod git;

@@ -11,11 +11,11 @@ No TigerGraph, Docker, Python, Node.js, bundled browser, GPU, or model download 
 | Lite | `graphxploit-<platform>-x86_64.zip` | Scanner, CLI, interactive graph, source inspector, Git impact, and local context export |
 | AI | `graphxploit-<platform>-x86_64-ai.zip` | Everything in Lite plus opt-in requests to an Ollama or OpenAI-compatible endpoint you configure |
 
-Lite never contains model-networking code. AI shows the exact source evidence and estimated token count before a request; nothing is sent until the user selects evidence and approves it.
+Lite never contains model-networking code. The AI edition connects only to an endpoint the user configures. The preview-based ask command requires explicit evidence approval; the interactive agent sends bounded read context while requiring a separate local confirmation for every write or process launch.
 
 ## Quick start
 
-Download a ZIP and matching `.sha256` file from [Releases](https://github.com/Ujjansh05/GraphXpolit/releases), verify it, and extract the single executable.
+Download a ZIP and matching `.sha256` file from [Releases](https://github.com/Ujjansh05/GraphXpolit/releases), verify it, and extract the executable with its small gx launcher.
 
 ```powershell
 # Windows
@@ -53,12 +53,12 @@ Static analysis intentionally does not guess ambiguous calls, dynamic dispatch, 
 
 ## Measured footprint
 
-A local Windows 11 verification of v2.1.0 measured:
+A local Windows 11 verification measured v2.2.0 binary sizes; the runtime/index figures are retained from the unchanged v2.1 indexing benchmark:
 
 | Item | Measurement |
 |---|---:|
-| Lite executable | 7,925,248 bytes (7.56 MiB) |
-| AI executable | 9,413,120 bytes (8.98 MiB) |
+| Lite executable (v2.2) | 7,981,568 bytes (7.61 MiB) |
+| AI executable (v2.2) | 9,505,792 bytes (9.06 MiB) |
 | 1,000-file initial scan | 15.80 s, 14.79 MiB peak working set |
 | 1,000-file unchanged rescan | 0.17 s, 8.09 MiB peak working set |
 | 1,000-file SQLite index | 1,019,904 bytes (1.0 MiB) |
@@ -70,6 +70,7 @@ These are single-machine engineering measurements, not universal guarantees. Rep
 
 - [Getting started](docs/GETTING_STARTED.md)
 - [CLI reference](docs/CLI.md)
+- [Interactive code agent](docs/AGENT.md)
 - [Deployment](docs/DEPLOYMENT.md)
 - [Privacy and security](docs/SECURITY.md)
 - [Releasing](docs/RELEASING.md)
@@ -86,3 +87,16 @@ cargo test --all-features --locked
 cargo build --release --locked                 # Lite
 cargo build --release --locked --features ai   # AI
 ```
+
+
+## Interactive terminal agent (v2.2)
+
+The AI edition can now be used like a compact coding CLI:
+
+```powershell
+gx -C C:\path\to\project
+gx -C C:\path\to\project "explain the startup flow"
+gx -C C:\path\to\project ui
+```
+
+It reuses the incremental local index, limits context to 1,000-8,000 tokens, supports read-only planning, and requires a separate confirmation for every edit, create, or process launch. Existing long `graphxploit` commands remain compatible. See [Interactive code agent](docs/AGENT.md) and [CLI reference](docs/CLI.md).
