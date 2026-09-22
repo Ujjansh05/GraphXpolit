@@ -1,5 +1,7 @@
 # GraphXploit
 
+[![Release](https://img.shields.io/github/v/release/Ujjansh05/GraphXpolit)](https://github.com/Ujjansh05/GraphXpolit/releases/latest) [![CI](https://github.com/Ujjansh05/GraphXpolit/actions/workflows/ci.yml/badge.svg)](https://github.com/Ujjansh05/GraphXpolit/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 GraphXploit is a lightweight, local code-intelligence workbench. It indexes a repository without executing it, visualizes static relationships, maps Git changes to affected symbols, and prepares compact evidence for codebase questions.
 
 No TigerGraph, Docker, Python, Node.js, bundled browser, GPU, or model download is required.
@@ -13,32 +15,42 @@ No TigerGraph, Docker, Python, Node.js, bundled browser, GPU, or model download 
 
 Lite never contains model-networking code. The AI edition connects only to an endpoint the user configures. The preview-based ask command requires explicit evidence approval; the interactive agent sends bounded read context while requiring a separate local confirmation for every write or process launch.
 
-## Quick start
+## Download and quick start
 
-Download a ZIP and matching `.sha256` file from [Releases](https://github.com/Ujjansh05/GraphXpolit/releases), verify it, and extract the executable with its small gx launcher.
+Download the current release and its matching `.sha256` file:
+
+| Platform | Lite — fully local analysis | AI — adds your existing model endpoint |
+|---|---|---|
+| Windows x86-64 | [ZIP](https://github.com/Ujjansh05/GraphXpolit/releases/latest/download/graphxploit-windows-x86_64.zip) · [SHA-256](https://github.com/Ujjansh05/GraphXpolit/releases/latest/download/graphxploit-windows-x86_64.zip.sha256) | [ZIP](https://github.com/Ujjansh05/GraphXpolit/releases/latest/download/graphxploit-windows-x86_64-ai.zip) · [SHA-256](https://github.com/Ujjansh05/GraphXpolit/releases/latest/download/graphxploit-windows-x86_64-ai.zip.sha256) |
+| Linux x86-64 | [ZIP](https://github.com/Ujjansh05/GraphXpolit/releases/latest/download/graphxploit-linux-x86_64.zip) · [SHA-256](https://github.com/Ujjansh05/GraphXpolit/releases/latest/download/graphxploit-linux-x86_64.zip.sha256) | [ZIP](https://github.com/Ujjansh05/GraphXpolit/releases/latest/download/graphxploit-linux-x86_64-ai.zip) · [SHA-256](https://github.com/Ujjansh05/GraphXpolit/releases/latest/download/graphxploit-linux-x86_64-ai.zip.sha256) |
+
+Extract the archive, open a terminal in that folder, and select a project.
 
 ```powershell
 # Windows
-.\graphxploit.exe scan "C:\path\to\project"
-.\graphxploit.exe serve "C:\path\to\project"
+.\gx.cmd -C "C:\path\to\project" ix
+.\gx.cmd -C "C:\path\to\project" ui
+.\gx.cmd -C "C:\path\to\project"
 ```
 
 ```bash
 # Linux
-./graphxploit scan /path/to/project
-./graphxploit serve /path/to/project
+chmod +x graphxploit gx
+./gx -C /path/to/project ix
+./gx -C /path/to/project ui
+./gx -C /path/to/project
 ```
 
-Open the printed `http://127.0.0.1:<port>` address in your existing browser. The application itself does not embed Chrome or another browser engine.
+The `ui` command prints a private `http://127.0.0.1:<port>` dashboard address for your existing browser. The application does not bundle a browser engine.
 
-Useful CLI workflows:
+The Lite edition supports scanning, search, graphs, Git impact, local context and dashboard commands. Natural-language questions require the AI edition and an Ollama or OpenAI-compatible endpoint that you configure.
 
 ```powershell
-.\graphxploit.exe search C:\project authenticate
-.\graphxploit.exe impact C:\project "src/auth.py::authenticate"
-.\graphxploit.exe diff C:\project --working
-.\graphxploit.exe context C:\project "What uses authentication?" --target authenticate --include-source
+.\gx.cmd model configure ollama http://127.0.0.1:11434 qwen2.5-coder:7b
+.\gx.cmd -C "C:\path\to\project" "explain the authentication flow"
 ```
+
+Existing long-form `graphxploit` commands remain supported. See the [CLI reference](docs/CLI.md) and [agent guide](docs/AGENT.md).
 
 ## Why developers use GraphXploit
 
@@ -100,4 +112,4 @@ cargo build --release --locked                 # Lite
 cargo build --release --locked --features ai   # AI
 ```
 
-Pls guys give ⭐ for repo if you like it 
+If GraphXploit is useful to you, please consider giving the repository a ⭐ — it helps other developers discover the project.

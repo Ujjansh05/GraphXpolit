@@ -30,13 +30,13 @@ Both platforms run formatting, warnings-as-errors Clippy, and all-feature tests.
 4. Confirm the dashboard is loopback-only and that Lite refuses model chat.
 5. Update `Cargo.toml`, `Cargo.lock`, documentation measurements, and known limitations together.
 
-## Create v2.1.0
+## Create v2.2.0
 
 ```bash
 git switch main
 git pull --ff-only origin main
-git tag -a v2.1.0 -m "GraphXploit 2.1.0"
-git push origin v2.1.0
+git tag -a v2.2.0 -m "GraphXploit 2.2.0"
+git push origin v2.2.0
 ```
 
 After publishing, download all four archives on clean machines, verify checksums, and perform a basic scan/dashboard test before announcing the release. Code signing is still an external release step and should be added before claiming a trusted publisher identity.
