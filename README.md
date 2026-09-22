@@ -112,4 +112,4 @@ cargo build --release --locked                 # Lite
 cargo build --release --locked --features ai   # AI
 ```
 
-If GraphXploit is useful to you, please consider giving the repository a ⭐ — it helps other developers discover the project.
+pls drop ⭐ If you find usedful !!
