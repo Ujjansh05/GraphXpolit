@@ -99,3 +99,5 @@ cargo test --all-features --locked
 cargo build --release --locked                 # Lite
 cargo build --release --locked --features ai   # AI
 ```
+
+Pls guys give ⭐ for repo if you like it 
