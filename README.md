@@ -40,14 +40,26 @@ Useful CLI workflows:
 .\graphxploit.exe context C:\project "What uses authentication?" --target authenticate --include-source
 ```
 
-## What developers can showcase
+## Why developers use GraphXploit
 
-- Interactive SVG dependency/impact graph with pan, zoom, source inspection, search, and ambiguity handling.
-- Working-tree and branch comparison that maps changed lines to symbols and potential dependants.
-- Low-token code chat: local retrieval, adaptive 1,000–8,000 token budget, evidence IDs, explicit source approval, and citation checking.
-- Incremental SQLite index with atomic scan generations; cancelled or failed scans leave the previous usable index intact.
-- Seven parser modes covering Python, JavaScript, TypeScript/TSX, Go, Rust, and Java.
-- Local-first security: loopback-only server, per-process 256-bit token, origin/host/fetch-metadata checks, restrictive CSP, bounded workers, requests, previews, queries, Git output, and model responses.
+- **Lightweight and local:** a 7.61 MiB Lite binary or 9.06 MiB AI binary, with no Docker, graph server, GPU, bundled browser, or background service.
+- **Understand unfamiliar code:** search symbols, inspect source, trace dependencies, and see the possible impact of a change before editing.
+- **Visualize relationships:** explore an interactive dependency and impact graph with search, pan, zoom, and source inspection.
+- **Review Git changes:** map working-tree or branch changes to affected symbols and potential dependants.
+- **Use fewer LLM tokens:** retrieve relevant local evidence first, then send only a bounded 1,000-8,000-token context to an existing Ollama or OpenAI-compatible endpoint.
+- **Keep control of changes:** every AI-proposed edit, file creation, or command requires local approval; plan mode is read-only and recent edits can be undone.
+- **Fast repeated analysis:** the SQLite index is incremental, so unchanged files are not parsed again.
+- **Useful across common stacks:** supports Python, JavaScript, TypeScript/TSX, Go, Rust, and Java.
+
+Typical uses include onboarding to a repository, planning refactors, reviewing pull requests, investigating regressions, exploring legacy systems, and checking change impact before modifying an API.
+
+```powershell
+gx -C C:\path\to\project
+gx -C C:\path\to\project "explain the authentication flow"
+gx -C C:\path\to\project i authenticate
+gx -C C:\path\to\project ch
+gx -C C:\path\to\project ui
+```
 
 Static analysis intentionally does not guess ambiguous calls, dynamic dispatch, reflection, generated code, or runtime behavior. Results are review evidence, not a guarantee that every effect is found.
 
@@ -87,16 +99,3 @@ cargo test --all-features --locked
 cargo build --release --locked                 # Lite
 cargo build --release --locked --features ai   # AI
 ```
-
-
-## Interactive terminal agent (v2.2)
-
-The AI edition can now be used like a compact coding CLI:
-
-```powershell
-gx -C C:\path\to\project
-gx -C C:\path\to\project "explain the startup flow"
-gx -C C:\path\to\project ui
-```
-
-It reuses the incremental local index, limits context to 1,000-8,000 tokens, supports read-only planning, and requires a separate confirmation for every edit, create, or process launch. Existing long `graphxploit` commands remain compatible. See [Interactive code agent](docs/AGENT.md) and [CLI reference](docs/CLI.md).
