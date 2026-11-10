@@ -12,7 +12,7 @@ Engineering checks for the GraphXploit 2.3 candidate, performed on Windows on 20
 - CLI/HTTP smoke tests pass for both editions: JSON search, source hashes, indexed-file overview, file graph/call evidence, missing-token refusal, cross-origin refusal and secret-file exclusion.
 - Embedded JavaScript passes `node --check`. Browser automation could not initialize in this environment; visual/interaction testing is not claimed.
 - OSV queried **208 public package/version entries** from Cargo.lock and returned **zero known advisory matches**. The supported-pattern working-tree secret check found no matches. Neither check proves absence of vulnerabilities or secrets.
-- Edition-specific CycloneDX SBOM generation succeeds. Hosted RustSec, Linux, Rust 1.89 and provenance jobs remain to be run on the final commit.
+- Edition-specific CycloneDX SBOM generation succeeds. Hosted Windows/Linux, Rust 1.90 and dependency checks are recorded per commit in GitHub Actions; release provenance still requires a tagged build.
 
 ## Resource observations
 

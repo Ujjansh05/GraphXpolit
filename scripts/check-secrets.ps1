@@ -6,7 +6,8 @@ $patterns = @('AKIA[0-9A-Z]{16}', 'gh[pousr]_[A-Za-z0-9]{36,}', 'github_pat_[A-Z
 $matchesFound = @()
 foreach ($path in $paths) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
-    $item = Get-Item -LiteralPath $path
+    # Unix dotfiles and Windows Hidden attributes require -Force for Get-Item.
+    $item = Get-Item -LiteralPath $path -Force
     if ($item.Length -gt 2MB) { continue }
     $content = [IO.File]::ReadAllText($item.FullName)
     foreach ($pattern in $patterns) {

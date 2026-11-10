@@ -20,7 +20,7 @@ This candidate combines the security fixes and code-understanding improvements i
 
 ## Required before a broad release
 
-- Run the updated Windows/Linux CI and Rust 1.89 job against the exact commit to be tagged. Review dependency audit output and attestation generation.
+- Run the updated Windows/Linux CI and Rust 1.90 job against the exact commit to be tagged. Review dependency audit output and attestation generation.
 - Exercise the dashboard visually, including keyboard interaction, graph selection, source display and preview approval.
 - Profile the 10,000-file cold scan. The measured candidate took several minutes despite inexpensive rescans; do not advertise large-project cold-scan speed yet.
 - Test actual large repositories, source with many symbols, parallel dashboard traffic, sustained sessions and low-memory physical devices. Synthetic measurements are not these tests.

@@ -2,7 +2,7 @@
 name = "graphxploit"
 version = "2.3.0"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.90"
 description = "Local, lightweight code impact analysis"
 license = "MIT"
 repository = "https://github.com/Ujjansh05/GraphXpolit"
@@ -28,7 +28,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 tokio = { version = "1.54.1", features = ["macros", "rt", "net", "signal"] }
 tree-sitter = "0.25"
-# Keep the declared Rust 1.89 minimum (0.1.9 requires 1.90).
+# tree-sitter-language 0.1.8 requires Rust 1.90, including in MSRV CI.
 tree-sitter-language = "=0.1.8"
 tree-sitter-go = "0.25"
 tree-sitter-java = "0.23"

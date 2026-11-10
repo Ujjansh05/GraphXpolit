@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
-          toolchain: '1.89.0'
+          toolchain: '1.90.0'
       - run: cargo check --all-features --locked
   dependency-audit:
     runs-on: ubuntu-latest
@@ -96,6 +96,9 @@ jobs:
       - name: Smoke-test packaged edition
         shell: pwsh
         run: ./scripts/smoke.ps1 -Binary '${{ matrix.binary }}'
+      - name: Test secret-check script on hidden files
+        shell: pwsh
+        run: ./scripts/test-check-secrets.ps1
       - name: Check supported credential patterns
         shell: pwsh
         run: ./scripts/check-secrets.ps1

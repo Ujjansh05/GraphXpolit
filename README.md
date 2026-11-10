@@ -112,7 +112,7 @@ RAM depends on code density, active operations, and the operating system. Browse
 
 ## Build from source
 
-Rust 1.89 or newer is needed only to build.
+Rust 1.90 or newer is needed only to build.
 
 ```bash
 cargo fmt --all -- --check

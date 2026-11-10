@@ -11,7 +11,7 @@ Each archive has a SHA-256 file and an edition/platform CycloneDX SBOM. Build jo
 
 ## Automated gates
 
-Both platforms run formatting, warnings-as-errors Clippy, and all-feature tests. Lite and AI binaries are built separately from `Cargo.lock`. CI enforces 25 MiB for Lite and 35 MiB for AI. The tag must exactly match the Cargo package version. A pinned RustSec job audits the lockfile and is a dependency of release builds. Regular CI also queries OSV, checks supported secret patterns, runs CLI/HTTP smoke tests and a synthetic memory regression ceiling. The MSRV job checks Rust 1.89. Weekly CI keeps dependency findings current.
+Both platforms run formatting, warnings-as-errors Clippy, and all-feature tests. Lite and AI binaries are built separately from `Cargo.lock`. CI enforces 25 MiB for Lite and 35 MiB for AI. The tag must exactly match the Cargo package version. A pinned RustSec job audits the lockfile and is a dependency of release builds. Regular CI also queries OSV, checks supported secret patterns, runs CLI/HTTP smoke tests and a synthetic memory regression ceiling. The MSRV job checks Rust 1.90. Weekly CI keeps dependency findings current.
 
 ## Before tagging
 
@@ -41,4 +41,4 @@ git push origin v2.3.0
 
 After publishing, download all four archives on clean machines, verify checksums, and perform a basic scan/dashboard test before announcing the release. Code signing is still an external release step and should be added before claiming a trusted publisher identity.
 
-The 2.3 source integrates security fixes and usability work in one candidate. Do not tag it until Windows/Linux CI and the Rust 1.89 job are green and the remaining checks in [IMPLEMENTATION.md](IMPLEMENTATION.md) are reviewed. These instructions do not imply that a tag or release has already been published.
+The 2.3 source integrates security fixes and usability work in one candidate. Do not tag it until Windows/Linux CI and the Rust 1.90 job are green and the remaining checks in [IMPLEMENTATION.md](IMPLEMENTATION.md) are reviewed. These instructions do not imply that a tag or release has already been published.
