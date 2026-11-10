@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Language {
     Python,
     JavaScript,
@@ -116,6 +116,9 @@ pub struct GraphEdge {
     pub source: String,
     pub target: String,
     pub kind: String,
+    pub evidence_path: String,
+    pub evidence_line: u32,
+    pub resolution: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -138,6 +141,8 @@ pub struct ContextEvidence {
     pub relationship: String,
     pub source: Option<String>,
     pub estimated_tokens: usize,
+    #[serde(default)]
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +156,8 @@ pub struct ContextPreview {
     pub budget_tokens: usize,
     pub complete: bool,
     pub model_endpoint: Option<String>,
+    #[serde(default)]
+    pub model_config_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,6 +172,7 @@ pub struct ChatAnswer {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangedSymbol {
+    pub basis: String,
     pub status: String,
     pub path: String,
     pub old_path: Option<String>,

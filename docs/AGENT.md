@@ -1,6 +1,6 @@
 # Interactive code agent
 
-GraphXploit 2.2 adds a terminal workflow designed for low-resource machines. It uses the existing local SQLite index for retrieval and connects only to a model endpoint you configure.
+GraphXploit 2.3 provides a terminal workflow designed for low-resource machines. It uses the existing local SQLite index for retrieval and connects only to a model endpoint you configure.
 
 ## Start
 
@@ -43,11 +43,11 @@ Sessions are ephemeral unless you use `/save`. Saved sessions contain user/assis
 
 ## Safety model
 
-Read-only inspection can run automatically. Every file edit, file creation, or process launch shows the exact diff or command and defaults to **No**. Plan mode refuses mutations completely.
+Sessions start in **plan** mode. Switch explicitly with `/mode agent` when you want approval-gated mutations. Local inspection can run automatically; remote model calls require approval each time. Every file edit, file creation, or process launch shows the exact diff or command and defaults to **No**. Plan mode refuses mutations completely.
 
-Edits are confined to canonical workspace paths, reject symlinks, binary/non-UTF-8 files, files above 2 MiB, replacements above 256 KiB, and stale SHA-256 hashes. The first version intentionally has no delete or move tool.
+Edits are confined to canonical workspace paths, reject symlinks, binary/non-UTF-8 files, files above 2 MiB, replacements above 256 KiB, and stale SHA-256 hashes. The path/hash is checked again after approval; replacements use a temporary file in the same directory. Undo verifies the post-edit hash and preserves conflicting external edits. The first version intentionally has no delete or move tool.
 
-Commands have no stdin, no background mode, a policy-bounded timeout (60 seconds by default, 300 maximum), and 1 MiB output limits. Direct shells and inline interpreter evaluation are rejected. The configured model API-key environment variable is removed from child processes.
+Commands have no stdin, no background mode, a process-group deadline (60 seconds by default, 300 maximum), and 1 MiB output limits per stream. Unix process groups and Windows Job Objects cover ordinary descendants and output drains. Direct shells and inline interpreter evaluation are rejected. Executables resolve from absolute PATH directories outside the workspace. The configured model API-key variable is removed from child processes. Approved commands run with your OS permissions: builds and test runners can execute repository code, access the network, or read other files. This is not an OS sandbox.
 
 Repository text and command output are treated as untrusted data, not model instructions.
 
@@ -86,4 +86,10 @@ On Linux, keep `gx` beside `graphxploit`, run `chmod +x gx graphxploit`, and opt
 
 ## Model data boundary
 
-Configuring and using the AI edition is opt-in. A natural-language agent turn sends its bounded context and subsequent bounded read-tool results to the configured endpoint. An approved command's bounded output may also be returned to that endpoint. File writes and process launches still require separate local confirmation. Use Lite or local slash commands when no repository data may leave the computer; use the legacy `ask` command when you want a full evidence preview before the first model request.
+Configuring AI is opt-in. For a remote endpoint, every planner or answer request displays the exact outgoing prompt and asks for approval. Tool results can contain source or command output and are previewed on subsequent requests. Non-interactive remote agent requests fail closed; use local context export for automation.
+
+A configured loopback model can receive bounded context automatically. The dashboard and `ask` still require evidence approval. The `ask --approve` flag is explicit authorization for its displayed evidence.
+
+Whole prompts include instructions, question, retrieved evidence, history and tool results. Older history/results and lower-ranked excerpts are compacted first. Budgets use estimates, not a provider tokenizer; byte limits are enforced and provider usage is reported when available. A serialized model request cannot exceed 32 KiB.
+
+Saved sessions may contain sensitive text in user questions or model answers. They are not encrypted. Data directories use mode 0700 on Unix; Windows uses the user profile's inherited permissions.

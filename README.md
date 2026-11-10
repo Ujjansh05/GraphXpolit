@@ -13,11 +13,11 @@ No TigerGraph, Docker, Python, Node.js, bundled browser, GPU, or model download 
 | Lite | `graphxploit-<platform>-x86_64.zip` | Scanner, CLI, interactive graph, source inspector, Git impact, and local context export |
 | AI | `graphxploit-<platform>-x86_64-ai.zip` | Everything in Lite plus opt-in requests to an Ollama or OpenAI-compatible endpoint you configure |
 
-Lite never contains model-networking code. The AI edition connects only to an endpoint the user configures. The preview-based ask command requires explicit evidence approval; the interactive agent sends bounded read context while requiring a separate local confirmation for every write or process launch.
+Lite never contains model-networking code. The AI edition connects only to an endpoint the user configures. The agent starts in read-only plan mode. Every remote agent request displays its prompt for approval, including follow-up requests containing tool output. Local model requests use your configured loopback endpoint. Edits and commands require separate local approval.
 
 ## Download and quick start
 
-Download the current release and its matching `.sha256` file:
+Download the current published release and its matching `.sha256` file. The source changes described below target **2.3.0**; the latest-download links remain on the previous version until its release workflow completes:
 
 | Platform | Lite — fully local analysis | AI — adds your existing model endpoint |
 |---|---|---|
@@ -54,12 +54,12 @@ Existing long-form `graphxploit` commands remain supported. See the [CLI referen
 
 ## Why developers use GraphXploit
 
-- **Lightweight and local:** a 7.61 MiB Lite binary or 9.06 MiB AI binary, with no Docker, graph server, GPU, bundled browser, or background service.
+- **Lightweight and local:** a small native executable, with no Docker, graph server, GPU, bundled browser, or background service.
 - **Understand unfamiliar code:** search symbols, inspect source, trace dependencies, and see the possible impact of a change before editing.
 - **Visualize relationships:** explore an interactive dependency and impact graph with search, pan, zoom, and source inspection.
-- **Review Git changes:** map working-tree or branch changes to affected symbols and potential dependants.
-- **Use fewer LLM tokens:** retrieve relevant local evidence first, then send only a bounded 1,000-8,000-token context to an existing Ollama or OpenAI-compatible endpoint.
-- **Keep control of changes:** every AI-proposed edit, file creation, or command requires local approval; plan mode is read-only and recent edits can be undone.
+- **Review Git changes:** compare temporary before/after indexes, retaining evidence for deleted and renamed symbols.
+- **Use fewer LLM tokens:** retrieve relevant local evidence first, then send a byte-bounded context with an estimated 1,000–8,000-token budget to an existing Ollama or OpenAI-compatible endpoint.
+- **Keep control of changes:** every AI-proposed edit, file creation, or command requires local approval; plan mode is the default and undo refuses to overwrite external changes.
 - **Fast repeated analysis:** the SQLite index is incremental, so unchanged files are not parsed again.
 - **Useful across common stacks:** supports Python, JavaScript, TypeScript/TSX, Go, Rust, and Java.
 
@@ -75,20 +75,29 @@ gx -C C:\path\to\project ui
 
 Static analysis intentionally does not guess ambiguous calls, dynamic dispatch, reflection, generated code, or runtime behavior. Results are review evidence, not a guarantee that every effect is found.
 
+## Explore and export
+
+```powershell
+gx -C C:\code\project ix
+gx -C C:\code\project map
+gx -C C:\code\project f authenticate --json
+gx -C C:\code\project ctx "explain authentication" --target authenticate --format markdown
+gx -C C:\code\project ui
+```
+
+The dashboard shows indexed files, languages and diagnostics. Pick a file to see its declarations; select a node to inspect source or explore one more step. Relationship filters separate calls, imports and containment, and edge tooltips show source evidence.
+
+Both indexing and agent search honor nested `.gitignore` and `.graphxploitignore` patterns. Secret-like paths, links, dependency directories and generated bundles are excluded. Source files larger than 2 MiB are skipped with a diagnostic. Run `gx ix --verify` when content may have changed without a timestamp/size change.
+
 ## Measured footprint
 
-A local Windows 11 verification measured v2.2.0 binary sizes; the runtime/index figures are retained from the unchanged v2.1 indexing benchmark:
+Windows measurements and their test conditions are recorded in [AUDIT.md](AUDIT.md). The 2.3 workbench remains a native executable with a per-project SQLite index; it does not install a model or browser.
 
-| Item | Measurement |
-|---|---:|
-| Lite executable (v2.2) | 7,981,568 bytes (7.61 MiB) |
-| AI executable (v2.2) | 9,505,792 bytes (9.06 MiB) |
-| 1,000-file initial scan | 15.80 s, 14.79 MiB peak working set |
-| 1,000-file unchanged rescan | 0.17 s, 8.09 MiB peak working set |
-| 1,000-file SQLite index | 1,019,904 bytes (1.0 MiB) |
-| Idle local server | 5.94 MiB working set |
+The local Windows 2.3 candidate ZIP is **2.31 MiB for Lite** or **3.07 MiB for AI**. Extracted executables are 8.78 MiB and 10.23 MiB respectively, plus project indexes. These are candidate measurements, not the previous published release's sizes.
 
-These are single-machine engineering measurements, not universal guarantees. Repository language, symbol density, filesystem, antivirus, and operating system affect results. CI rejects Lite binaries above 25 MiB and AI binaries above 35 MiB.
+Use `gx cache stats` to inspect actual index sizes. Preview cleanup with `gx cache prune --project ID --dry-run`, then add `--yes` to remove that generated index. Source files and saved sessions are preserved.
+
+RAM depends on code density, active operations, and the operating system. Browser and model RAM are additional. Git comparison temporarily allows up to 64 MiB of source per revision plus its index and removes those files after the report. CI enforces executable ceilings of 25 MiB (Lite) and 35 MiB (AI).
 
 ## Documentation
 
@@ -99,10 +108,11 @@ These are single-machine engineering measurements, not universal guarantees. Rep
 - [Privacy and security](docs/SECURITY.md)
 - [Releasing](docs/RELEASING.md)
 - [Runtime and security audit](AUDIT.md)
+- [Implementation status and release checks](docs/IMPLEMENTATION.md)
 
 ## Build from source
 
-Rust stable 1.85 or newer is needed only to build.
+Rust 1.89 or newer is needed only to build.
 
 ```bash
 cargo fmt --all -- --check
@@ -112,4 +122,4 @@ cargo build --release --locked                 # Lite
 cargo build --release --locked --features ai   # AI
 ```
 
-pls drop ⭐ If you find usedful !!
+If GraphXploit is useful to you, consider starring the repository.

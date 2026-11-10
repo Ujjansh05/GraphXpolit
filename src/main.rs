@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use graphxploit::safety::terminal as terminal_text;
 use graphxploit::{
     agent::{self, AgentOptions},
     ai::{self, ModelConfig, Provider},
@@ -35,6 +36,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Browse indexed files, languages, and scan diagnostics.
+    Map,
+    /// Export compact evidence without contacting a model.
+    Ctx {
+        question: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, value_enum, default_value = "markdown")]
+        format: ContextFormat,
+    },
+    /// Inspect or remove generated project indexes.
+    Cache {
+        #[command(subcommand)]
+        action: CacheCommand,
+    },
     /// Scan a project and build or update its local index.
     Scan {
         path: PathBuf,
@@ -141,18 +157,24 @@ enum Command {
         query: String,
         #[arg(long, default_value_t = 25)]
         limit: usize,
+        #[arg(long)]
+        json: bool,
     },
     /// Show impact in the current workspace.
     I {
         target: String,
         #[arg(long, default_value_t = 5)]
         depth: u32,
+        #[arg(long)]
+        json: bool,
     },
     /// Show dependencies in the current workspace.
     D {
         target: String,
         #[arg(long, default_value_t = 5)]
         depth: u32,
+        #[arg(long)]
+        json: bool,
     },
     /// Show Git change impact in the current workspace.
     Ch { base: Option<String> },
@@ -193,6 +215,26 @@ enum ProviderArg {
     Openai,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum ContextFormat {
+    Markdown,
+    Json,
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    Stats,
+    /// Print the selected generated cache; remove only with --yes.
+    Prune {
+        #[arg(long)]
+        project: String,
+        #[arg(long, conflicts_with = "yes")]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 impl From<ProviderArg> for Provider {
     fn from(value: ProviderArg) -> Self {
         match value {
@@ -212,22 +254,28 @@ fn print_result(result: &graphxploit::QueryResult, json: bool) -> Result<()> {
         for candidate in &result.candidates {
             println!(
                 "  {}:{}  {} ({})",
-                candidate.path, candidate.line, candidate.qualified_name, candidate.kind
+                terminal_text(&candidate.path),
+                candidate.line,
+                terminal_text(&candidate.qualified_name),
+                candidate.kind
             );
         }
         return Ok(());
     }
-    println!("{}: {}", result.mode, result.target);
+    println!("{}: {}", result.mode, terminal_text(&result.target));
     if let Some(message) = &result.message {
         println!("{message}");
     }
     for node in &result.results {
         println!(
             "  [{}] {}:{}  {}",
-            node.depth, node.path, node.line, node.qualified_name
+            node.depth,
+            terminal_text(&node.path),
+            node.line,
+            terminal_text(&node.qualified_name)
         );
         if node.evidence_path.len() > 1 {
-            println!("      {}", node.evidence_path.join(" -> "));
+            println!("      {}", terminal_text(&node.evidence_path.join(" -> ")));
         }
     }
     if !result.complete {
@@ -238,6 +286,9 @@ fn print_result(result: &graphxploit::QueryResult, json: bool) -> Result<()> {
 
 fn direct_agent_prompt() -> Result<Option<(AgentOptions, String)>> {
     const COMMANDS: &[&str] = &[
+        "map",
+        "ctx",
+        "cache",
         "scan",
         "impact",
         "dependencies",
@@ -290,6 +341,7 @@ fn direct_agent_prompt() -> Result<Option<(AgentOptions, String)>> {
             "--no-scan" => no_scan = true,
             "-h" | "--help" | "-V" | "--version" => return Ok(None),
             value if prompt.is_empty() && COMMANDS.contains(&value) => return Ok(None),
+            value if value.starts_with('-') && prompt.is_empty() => return Ok(None),
             value => prompt.push(value.to_owned()),
         }
         index += 1;
@@ -307,7 +359,7 @@ fn direct_agent_prompt() -> Result<Option<(AgentOptions, String)>> {
         prompt.join(" "),
     )))
 }
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     if let Some((options, prompt)) = direct_agent_prompt()? {
         agent::one_shot(options, prompt).await?;
@@ -325,6 +377,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     match cli.command {
+        Some(Command::Map) => println!("{}", serde_json::to_string_pretty(&graphxploit::store::Store::read(&cli.cwd)?.overview()?)?),
+        Some(Command::Ctx {question, target, format}) => {
+            let p = context_preview(&cli.cwd, &question, target.as_deref(), true, Some(cli.budget), None)?;
+            match format {
+                ContextFormat::Json => println!("{}", serde_json::to_string_pretty(&p)?),
+                ContextFormat::Markdown => {
+                    println!("# Code context\n\nQuestion: {}\n\nRevision: {} · approximately {} tokens (estimate)\n", graphxploit::safety::terminal(&question), p.revision, p.estimated_tokens);
+                    for e in p.evidence { println!("## [{}] {}\n\n{}:{}-{}\n\nSHA-256: {}\n\n{}\n", e.id, graphxploit::safety::terminal(&e.qualified_name), graphxploit::safety::terminal(&e.path), e.start_line, e.end_line, e.content_hash.unwrap_or_default(), graphxploit::safety::terminal(&e.source.unwrap_or_default())); }
+                    if !p.complete { println!("Context is partial; narrow the target for more detail."); }
+                }
+            }
+        },
+        Some(Command::Cache {action}) => match action {
+            CacheCommand::Stats => println!("{}", serde_json::to_string_pretty(&graphxploit::cache::stats()?)?),
+            CacheCommand::Prune {project, yes, ..} => graphxploit::cache::prune(&project, yes)?,
+        },
         Some(Command::Scan { path, verify }) => {
             let summary = scan_project(
                 &path,
@@ -368,7 +436,7 @@ async fn main() -> Result<()> {
                 for item in result.items {
                     println!(
                         "{}:{}  {} ({})",
-                        item.path, item.line, item.qualified_name, item.kind
+                        terminal_text(&item.path), item.line, terminal_text(&item.qualified_name), item.kind
                     );
                 }
                 if !result.complete {
@@ -424,7 +492,7 @@ async fn main() -> Result<()> {
                 .map(|item| item.id.clone())
                 .collect::<Vec<_>>();
             let answer = ai::ask_preview(&preview, &selected).await?;
-            println!("\n{}", answer.answer);
+            println!("\n{}", terminal_text(&answer.answer));
             if let Some(warning) = answer.citation_warning {
                 println!("\nCitation warning: {warning}");
             }
@@ -459,13 +527,13 @@ async fn main() -> Result<()> {
                 }
                 for change in result.changes {
                     println!(
-                        "  {}  {}:{}  {}",
-                        change.status, change.path, change.line, change.qualified_name
+                        "  {} ({})  {}:{}  {}",
+                        change.status, change.basis, terminal_text(&change.path), change.line, terminal_text(&change.qualified_name)
                     );
                     for affected in change.affected.iter().take(5) {
                         println!(
                             "      affects {}:{}  {}",
-                            affected.path, affected.line, affected.qualified_name
+                            terminal_text(&affected.path), affected.line, terminal_text(&affected.qualified_name)
                         );
                     }
                 }
@@ -479,7 +547,7 @@ async fn main() -> Result<()> {
         }) => {
             let question = question
                 .unwrap_or_else(|| format!("What is the potential impact of changing {target}?"));
-            println!("{}", ai::explain(&path, &target, depth, &question).await?);
+            println!("{}", terminal_text(&ai::explain(&path, &target, depth, &question).await?));
         }
         Some(Command::Model { command }) => {
             match command {
@@ -502,7 +570,7 @@ async fn main() -> Result<()> {
                 }
                 ModelCommand::Status => match ai::load_config() {
                     Ok(config) => println!(
-                        "Configured {:?} model '{}' at {}. Automatic source sharing is disabled; source-backed chat always requires preview approval.",
+                        "Configured {:?} model '{}' at {}. Remote agent requests require approval of each prompt. Local model requests use the configured loopback endpoint.",
                         config.provider, config.model, config.endpoint
                     ),
                     Err(error) => println!("No usable model configuration: {error}"),
@@ -519,12 +587,14 @@ async fn main() -> Result<()> {
             let summary = scan_project(&cli.cwd, ScanOptions { verify, ..Default::default() })?;
             println!("{} files · {} parsed · {} unchanged · {} symbols · generation {}", summary.files_seen, summary.files_parsed, summary.files_skipped, summary.symbols, summary.generation);
         }
-        Some(Command::F { query, limit }) => {
+        Some(Command::F { query, limit, json }) => {
             let result = search(&cli.cwd, &query, limit)?;
-            for item in result.items { println!("{}:{}  {} ({})", item.path, item.line, item.qualified_name, item.kind); }
+            if json { println!("{}", serde_json::to_string_pretty(&result)?); }
+            else { for item in result.items { println!("{}:{}  {} ({})", graphxploit::safety::terminal(&item.path), item.line, graphxploit::safety::terminal(&item.qualified_name), item.kind); }
+            if !result.complete { println!("More matches exist; narrow the query."); } }
         }
-        Some(Command::I { target, depth }) => print_result(&impact(&cli.cwd, &target, depth)?, false)?,
-        Some(Command::D { target, depth }) => print_result(&dependencies(&cli.cwd, &target, depth)?, false)?,
+        Some(Command::I { target, depth, json }) => print_result(&impact(&cli.cwd, &target, depth)?, json)?,
+        Some(Command::D { target, depth, json }) => print_result(&dependencies(&cli.cwd, &target, depth)?, json)?,
         Some(Command::Ch { base }) => {
             let result = if let Some(base) = base { branch_changes(&cli.cwd, &base)? } else { working_changes(&cli.cwd)? };
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -545,12 +615,10 @@ async fn main() -> Result<()> {
                 "Edition: {}",
                 if cfg!(feature = "ai") { "AI" } else { "Lite" }
             );
-            let git = ProcessCommand::new("git")
-                .arg("--version")
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            let git = graphxploit::process::trusted_program("git", &cli.cwd).ok()
+                .and_then(|p| graphxploit::process::capture(ProcessCommand::new(p).arg("--version"), std::time::Duration::from_secs(5), 1024).ok())
+                .filter(|(status,_,_)| status.success())
+                .map(|(_,out,_)| graphxploit::safety::terminal(String::from_utf8_lossy(&out).trim()));
             println!(
                 "Git change analysis: {}",
                 git.as_deref().unwrap_or("unavailable")
@@ -574,15 +642,15 @@ fn print_context_preview(preview: &graphxploit::model::ContextPreview) {
         println!(
             "\n[{}] {}:{}-{}  {} ({})\nReason: {}",
             item.id,
-            item.path,
+            terminal_text(&item.path),
             item.start_line,
             item.end_line,
-            item.qualified_name,
+            terminal_text(&item.qualified_name),
             item.kind,
-            item.relationship
+            terminal_text(&item.relationship)
         );
         if let Some(source) = &item.source {
-            println!("{source}");
+            println!("{}", terminal_text(source));
         }
     }
     if !preview.complete {

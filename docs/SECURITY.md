@@ -8,9 +8,9 @@ Anyone able to run software as the same operating-system user can already read t
 
 ## Local indexing
 
-Lite has no model-networking dependency. Both editions parse supported files without executing project code and store generated metadata in a per-project SQLite database outside the repository. Scans use an immediate outer transaction and a monotonically increasing generation. A cancelled or failed scan rolls back, so queries never observe a half-updated index.
+Lite has no model-networking dependency. Both editions parse supported files without executing project code and store generated metadata in a per-project SQLite database outside the repository. Scans use an immediate outer transaction and a monotonically increasing generation. Unchanged scans do not advance the generation. Queries open SQLite read-only with a 2 MiB cache, and writers use a 4 MiB cache. A cancelled or failed scan rolls back, so queries never observe a half-updated index.
 
-Edge rebuilding streams references in 512-row batches instead of loading the symbol/reference graph into memory. Ambiguous targets are left unresolved.
+Source discovery streams files, reuses language parsers, and bounds AST traversal. Changed scans refresh affected call edges; import edges are rebuilt. The graph still uses heuristic static resolution: lexical names and a subset of explicit Python/JavaScript imports are supported, while unknown receivers and ambiguous module names remain unresolved.
 
 ## Dashboard controls
 
@@ -29,9 +29,13 @@ Resource bounds include:
 - source excerpts capped at 200 lines and 256 KiB;
 - source files capped at 2 MiB by default;
 - Git subprocesses capped at 15 seconds and 8 MiB output;
-- model responses capped at 1 MiB.
+- model responses capped at 1 MiB and serialized requests at 32 KiB;
+- AST traversal capped at 200,000 nodes and depth 512;
+- Git snapshots capped at 10,000 supported files and 64 MiB per revision.
 
-Source preview paths are canonicalized and must remain inside the selected project.
+Busy read/model workers return HTTP 429 rather than accumulating an unbounded worker queue. Limits bound individual operations; they do not make the local server suitable for a public hostile network.
+
+Indexing, previews and agent reads reject workspace escapes, symlinks, Windows reparse points, alternate data streams, secret-like names and excluded paths. Ignore patterns apply at their directory roots. File contents are bounded on read; a source hash and excerpt are derived from the same bytes. There is no claim of atomic confinement against a hostile process changing ancestor directories concurrently.
 
 ## Git safety
 
@@ -47,12 +51,20 @@ AI support is compiled out of Lite. In AI edition:
 - API-key values remain in environment variables;
 - connect/request timeouts and response byte limits are enforced;
 - repository content is labelled untrusted in the prompt;
-- a context preview is bound to the question, target, index revision, evidence, and configured endpoint;
+- a context preview is bound to the question, target, index revision, evidence, and full model configuration (provider, endpoint, model and protocol);
 - the user must select evidence and explicitly approve it before sending;
 - expired or substituted preview IDs are rejected;
 - answers are checked for `[E#]` citations and unknown/missing citations are surfaced.
 
 Approved evidence can contain source. Review the destination and every checked excerpt before approval. Provider retention and training policies are outside GraphXploit's control.
+
+## Agent and command boundary
+
+Plan mode is the default. Every remote agent prompt requires interactive approval, including follow-ups. Local model requests are automatic after configuration. Edits are checked again after approval; undo verifies that the current file still matches the edit being reverted. Terminal control characters are escaped in model responses and mutation previews.
+
+Command approvals are not a sandbox. An approved build tool or script can run arbitrary repository code with the user's OS permissions. Program-name restrictions, PATH checks, deadlines, output caps, process groups and API-key environment removal reduce accidents; they do not isolate an approved malicious process. A child that deliberately escapes ordinary process-group containment is outside this guarantee.
+
+Generated indexes and saved sessions are local, unencrypted data. Filename exclusions cannot identify every secret embedded in ordinary source. Review outgoing evidence.
 
 ## Known limits
 

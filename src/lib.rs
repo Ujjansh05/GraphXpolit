@@ -6,8 +6,11 @@
 pub mod agent;
 pub mod ai;
 pub mod analysis;
+pub mod cache;
 pub mod git;
 pub mod model;
+pub mod process;
+pub mod safety;
 pub mod store;
 pub mod web;
 

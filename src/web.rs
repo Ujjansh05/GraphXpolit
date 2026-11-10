@@ -145,6 +145,7 @@ struct GitRequest {
 
 #[derive(Serialize)]
 struct Capabilities {
+    version: &'static str,
     edition: &'static str,
     ai_enabled: bool,
     max_graph_nodes: usize,
@@ -194,6 +195,7 @@ pub async fn serve(default_root: Option<PathBuf>, port: u16) -> anyhow::Result<(
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/api/v1/capabilities", get(capabilities))
         .route("/api/v1/search", post(run_search))
+        .route("/api/v1/overview", post(overview))
         .route("/api/v1/graph", post(run_graph))
         .route("/api/v1/impact", post(run_impact))
         .route("/api/v1/dependencies", post(run_dependencies))
@@ -490,6 +492,7 @@ async fn capabilities(
 ) -> ApiResult<Capabilities> {
     authenticate(&headers, &state)?;
     Ok(Json(Capabilities {
+        version: env!("CARGO_PKG_VERSION"),
         edition: if cfg!(feature = "ai") { "AI" } else { "Lite" },
         ai_enabled: cfg!(feature = "ai"),
         max_graph_nodes: 300,
@@ -507,6 +510,16 @@ async fn run_search(
     let root = request_root(&request.root)?;
     let query = request.query.trim().to_owned();
     run_read(&state, move || search(&root, &query, request.limit)).await
+}
+
+async fn overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ScanRequest>,
+) -> ApiResult<serde_json::Value> {
+    authenticate(&headers, &state)?;
+    let root = request_root(&request.root)?;
+    run_read(&state, move || crate::store::Store::read(&root)?.overview()).await
 }
 
 async fn run_graph(
@@ -589,12 +602,12 @@ async fn run_chat(
                 )
             })?
     };
-    let _permit = state
-        .model_slot
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| worker_error())?;
+    let _permit = state.model_slot.clone().try_acquire_owned().map_err(|_| {
+        ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Worker busy; retry shortly.".into(),
+        )
+    })?;
     crate::ai::ask_preview(&preview, &request.evidence_ids)
         .await
         .map(Json)

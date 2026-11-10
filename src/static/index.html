@@ -21,6 +21,12 @@
         <button id="cancel" class="secondary" disabled>Cancel</button>
       </div>
       <pre id="scan-result" class="notice hidden"></pre>
+      <details open><summary>Browse indexed files</summary>
+        <button id="refresh-overview" class="secondary">Refresh overview</button>
+        <input id="folder-filter" placeholder="Filter by folder or language" aria-label="Filter indexed files">
+        <p id="overview-status" class="muted"></p><div id="project-files" class="suggestions"></div>
+        <pre id="diagnostics" class="notice hidden"></pre>
+      </details>
     </section>
 
     <nav class="tabs" aria-label="Workspace">
@@ -40,6 +46,7 @@
         </select>
         <label class="compact">Depth <input id="depth" type="number" min="1" max="12" value="4"></label>
         <button id="graph">Visualize</button>
+        <select id="edge-filter" aria-label="Relationship filter"><option value="">All relationships</option><option>CALLS</option><option>IMPORTS</option><option>CONTAINS</option></select>
       </div>
       <div id="search-results" class="suggestions hidden"></div>
       <div id="graph-message" class="message" role="status">Scan a project, then choose a symbol.</div>
@@ -53,6 +60,7 @@
         <aside class="inspector">
           <h3>Inspector</h3>
           <div id="inspector-meta" class="muted">Select a graph node or search result.</div>
+          <button id="expand-node" class="secondary" disabled>Explore selected node</button>
           <pre id="source" class="source hidden" aria-live="polite"></pre>
         </aside>
       </div>

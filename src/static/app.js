@@ -67,7 +67,7 @@
   async function loadCapabilities() {
     try {
       state.capabilities = await api("/api/v1/capabilities", undefined, "GET");
-      els.edition.textContent = "v2.1 " + state.capabilities.edition;
+      els.edition.textContent = "v" + state.capabilities.version + " " + state.capabilities.edition;
       if (!state.capabilities.ai_enabled) {
         els.ask.textContent = "AI edition required";
         els.chatMessage.textContent = "Lite edition builds and exports compact local context. Install the AI archive to send approved evidence to an OpenAI-compatible endpoint.";
@@ -99,6 +99,8 @@
           s.files_seen + " files seen · " + s.files_parsed + " parsed · " + s.files_skipped +
           " unchanged\n" + s.symbols + " symbols · " + s.relationships +
           " relationships · generation " + s.generation + "\nIndex: " + s.database;
+        if (s.files_parsed === 0 && !s.cancelled) els.scanResult.textContent += "\nIndex reused successfully: no source changes needed parsing.";
+        loadOverview();
       }
     } catch (error) {
       state.job = null;
@@ -173,6 +175,8 @@
   });
 
   async function showSource(item) {
+    state.selected = item;
+    $("expand-node").disabled = false;
     try {
       els.inspectorMeta.textContent = item.kind + " · " + item.path + ":" + item.line;
       els.source.classList.remove("hidden");
@@ -200,6 +204,7 @@
     els.viewport.setAttribute("transform", "translate(" + t.x + " " + t.y + ") scale(" + t.scale + ")");
   }
   function renderGraph(data) {
+    state.lastGraph = data;
     clear(els.edges);
     clear(els.nodes);
     if (!data.nodes.length) {
@@ -227,6 +232,7 @@
     defs.append(marker);
     els.edges.append(defs);
     data.edges.forEach((edge) => {
+      if ($("edge-filter").value && edge.kind !== $("edge-filter").value) return;
       const a = positions.get(edge.source), b = positions.get(edge.target);
       if (!a || !b) return;
       const line = svgNode("path", {
@@ -234,7 +240,8 @@
         class: "graph-edge"
       });
       const title = svgNode("title");
-      title.textContent = edge.kind;
+      title.textContent = edge.kind + " · " + edge.evidence_path + ":" + edge.evidence_line + " · " + edge.resolution;
+      line.addEventListener("click", () => showSource({path:edge.evidence_path, line:edge.evidence_line || 1, kind:edge.kind, id:edge.source}));
       line.append(title);
       els.edges.append(line);
     });
@@ -250,6 +257,7 @@
       tooltip.textContent = item.id + "\n" + item.path + ":" + item.line;
       group.append(title, kind, tooltip);
       group.addEventListener("click", () => showSource(item));
+      group.addEventListener("dblclick", () => { showSource(item); $("expand-node").click(); });
       group.addEventListener("keydown", (event) => {
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
@@ -312,7 +320,7 @@
     clear(els.gitResults);
     try {
       els.gitAnalyze.disabled = true;
-      setMessage(els.gitMessage, "Reading bounded Git diff and mapping changed lines…");
+      setMessage(els.gitMessage, "Building bounded before/after indexes for Git changes…");
       const data = await api("/api/v1/git-impact", {
         root: rootValue(), mode: els.gitMode.value, base: els.gitBase.value.trim() || "main"
       });
@@ -320,12 +328,12 @@
       data.changes.forEach((change) => {
         const details = el("details", "result");
         const summary = el("summary", "", change.qualified_name);
-        details.append(summary, el("div", "meta", change.status + " · " + change.kind + " · " + change.path + ":" + change.line));
+        details.append(summary, el("div", "meta", change.status + " · " + change.basis + " · " + change.kind + " · " + change.path + ":" + change.line));
         if (change.affected.length) {
           const list = el("ul", "impact-list");
           change.affected.forEach((item) => {
             const row = el("li", "", item.qualified_name + " — " + item.relationship);
-            row.addEventListener("click", () => showSource(item));
+            if (change.basis === "after") row.addEventListener("click", () => showSource(item));
             list.append(row);
           });
           details.append(list);
@@ -350,7 +358,7 @@
   function renderPreview(preview) {
     state.preview = preview;
     clear(els.evidence);
-    els.previewSummary.textContent = preview.evidence.length + " evidence items · about " + preview.estimated_tokens.toLocaleString() + " tokens · revision " + preview.revision.slice(0, 10);
+    els.previewSummary.textContent = preview.evidence.length + " evidence items · about " + preview.estimated_tokens.toLocaleString() + " tokens (estimate) · " + preview.revision + " · destination: " + (preview.model_endpoint || "local export only");
     preview.evidence.forEach((item) => {
       const label = el("label", "evidence-item");
       const checkbox = document.createElement("input");
@@ -439,5 +447,35 @@
     }
   });
 
+  let overviewFiles = [];
+  function renderFiles() {
+    const box = $("project-files"); box.replaceChildren();
+    const query = $("folder-filter").value.toLowerCase();
+    overviewFiles.filter(f => (f.path + " " + f.language).toLowerCase().includes(query)).forEach(f => {
+      const button = el("button", "suggestion", f.path + " · " + f.language + " · " + f.symbols + " symbols");
+      button.type = "button";
+      button.addEventListener("click", () => { els.target.value = f.path; els.graph.click(); });
+      box.append(button);
+    });
+  }
+  async function loadOverview() {
+    if (!els.root.value.trim()) return;
+    try {
+      const data = await api("/api/v1/overview", {root: rootValue()});
+      overviewFiles = data.files;
+      $("overview-status").textContent = data.total_files + " files · generation " + data.generation + " · " + data.freshness + (data.complete ? "" : " First 300 files shown; use symbol search for more.");
+      $("diagnostics").textContent = data.diagnostics.map(d => d.path + ": " + d.message).join("\n");
+      $("diagnostics").classList.toggle("hidden", !data.diagnostics.length);
+      renderFiles();
+    } catch (error) { $("overview-status").textContent = error.message + " — Scan project to get started."; }
+  }
+  $("folder-filter").addEventListener("input", renderFiles);
+  $("refresh-overview").addEventListener("click", loadOverview);
+  $("edge-filter").addEventListener("change", () => { if (state.lastGraph) renderGraph(state.lastGraph); });
+  $("expand-node").addEventListener("click", () => { if (!state.selected) return; els.target.value = state.selected.id || state.selected.qualified_name; els.depth.value = 1; els.graph.click(); });
+  function invalidatePreview() { state.preview = null; els.approve.checked = false; els.previewBox.classList.add("hidden"); updateAskState(); }
+  [els.question, els.chatTarget, els.budget].forEach(input => input.addEventListener("input", invalidatePreview));
+  els.root.addEventListener("change", () => { invalidatePreview(); state.lastGraph = null; state.selected = null; overviewFiles = []; renderFiles(); clear(els.nodes); clear(els.edges); els.source.textContent = ""; $("expand-node").disabled = true; loadOverview(); });
   loadCapabilities();
+  loadOverview();
 })();

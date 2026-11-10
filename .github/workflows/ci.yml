@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'
 
 permissions:
   contents: read
@@ -13,6 +16,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: '1.89.0'
+      - run: cargo check --all-features --locked
   check:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -35,6 +46,11 @@ jobs:
         run: cargo test --locked
       - name: Test AI edition
         run: cargo test --all-features --locked
+      - name: Check embedded dashboard syntax
+        run: node --check src/static/app.js
+      - name: Check supported credential patterns
+        shell: pwsh
+        run: ./scripts/check-secrets.ps1
       - name: Build default Lite release
         run: cargo build --release --locked
       - name: Enforce Lite binary budget
@@ -44,6 +60,21 @@ jobs:
           if ((Get-Item $binary).Length -gt 25MB) {
             throw "Lite binary exceeds the 25 MiB budget."
           }
+      - name: Verify Lite behavior and memory ceiling
+        # Run Lite smoke checks before the AI build replaces the executable.
+        shell: pwsh
+        run: |
+          $binary = if ($IsWindows) { 'target/release/graphxploit.exe' } else { 'target/release/graphxploit' }
+          ./scripts/smoke.ps1 -Binary $binary
+          $measurements = @(./scripts/benchmark.ps1 -Binary $binary -Files @(100,1000))
+          if (@($measurements | Where-Object { $_.sampled_peak_working_set_bytes -gt 128MB }).Count) { throw 'Synthetic scan exceeded the 128 MiB regression ceiling.' }
+          $measurements | ConvertTo-Json -Depth 4 | Set-Content target/benchmark.json
+      - name: Save benchmark observations
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmark-${{ matrix.os }}
+          path: target/benchmark.json
+          if-no-files-found: error
       - name: Build AI release
         run: cargo build --release --locked --features ai
       - name: Enforce AI binary budget
@@ -59,6 +90,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Query OSV for locked dependencies
+        shell: pwsh
+        run: ./scripts/audit.ps1
       - name: Audit Cargo.lock
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:

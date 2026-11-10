@@ -1,14 +1,15 @@
 use crate::model::{
-    ContextEvidence, ContextPreview, GraphEdge, GraphNode, GraphResult, ImpactNode, Language,
-    ParsedFile, ParsedReference, ParsedSymbol, QueryResult, SearchResult,
+    ContextEvidence, ContextPreview, GraphNode, GraphResult, ImpactNode, Language, ParsedFile,
+    ParsedReference, ParsedSymbol, QueryResult, SearchResult,
 };
 use crate::store::Store;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File};
-use std::io::Read;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::fs;
+
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -23,7 +24,6 @@ const MAX_QUERY_DEPTH: u32 = 25;
 const MAX_SOURCE_EXCERPT_LINES: usize = 200;
 const MAX_SOURCE_EXCERPT_BYTES: u64 = 256 * 1024;
 const MAX_DISCOVERED_FILES: usize = 100_000;
-const MAX_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_TARGET_BYTES: usize = 4096;
 const MAX_CONTEXT_EVIDENCE: usize = 12;
 const DEFAULT_CONTEXT_TOKENS: usize = 4_000;
@@ -49,7 +49,6 @@ impl Default for ScanOptions {
 
 #[derive(Debug)]
 struct SourceFile {
-    absolute: PathBuf,
     relative: String,
     language: Language,
     modified_ns: i64,
@@ -57,21 +56,43 @@ struct SourceFile {
 }
 
 pub fn scan_project(root: &Path, options: ScanOptions) -> Result<crate::model::ProjectSummary> {
-    let mut store = Store::open(root)?;
-    let sources = discover_source_files(store.root(), &options)?;
+    scan_store(Store::open(root)?, options)
+}
+
+pub(crate) fn scan_store(
+    mut store: Store,
+    options: ScanOptions,
+) -> Result<crate::model::ProjectSummary> {
+    let root = store.root().to_owned();
+    let sources = discover_source_files(&root);
+    let mut files_seen = 0;
+    let mut parsers = HashMap::new();
     let existing = store.existing_files()?;
     store.begin_scan()?;
     let mut seen = HashSet::new();
     let mut parsed_count = 0usize;
     let mut skipped_count = 0usize;
     let mut cancelled = is_cancelled(&options);
+    let mut deleted_count = 0;
 
-    for source in &sources {
+    for source in sources {
+        let source = source?;
+        files_seen += 1;
+        if files_seen > MAX_DISCOVERED_FILES {
+            anyhow::bail!("source-file limit exceeded; add ignore rules");
+        }
         if is_cancelled(&options) {
             cancelled = true;
             break;
         }
         seen.insert(source.relative.clone());
+        let unchanged = existing.get(&source.relative).filter(|record| {
+            record.modified_ns == source.modified_ns && record.size == source.length
+        });
+        if unchanged.is_some() && !options.verify {
+            skipped_count += 1;
+            continue;
+        }
         if source.length > options.max_file_bytes {
             let parsed = ParsedFile {
                 diagnostic: Some(format!(
@@ -87,22 +108,13 @@ pub fn scan_project(root: &Path, options: ScanOptions) -> Result<crate::model::P
                 source.language.label(),
                 &parsed,
             )?;
+            store.record_size(&source.relative, source.length)?;
             parsed_count += 1;
             continue;
         }
-        let unchanged = existing
-            .get(&source.relative)
-            .filter(|record| record.modified_ns == source.modified_ns);
-        if unchanged.is_some() && !options.verify {
-            skipped_count += 1;
-            continue;
-        }
-        let mut content = Vec::with_capacity(source.length.min(options.max_file_bytes) as usize);
-        File::open(&source.absolute)
-            .with_context(|| format!("could not open {}", source.absolute.display()))?
-            .take(options.max_file_bytes + 1)
-            .read_to_end(&mut content)
-            .with_context(|| format!("could not read {}", source.absolute.display()))?;
+        let content =
+            crate::safety::read(&root, Path::new(&source.relative), options.max_file_bytes)
+                .with_context(|| format!("could not read {}", source.relative))?;
         if content.len() as u64 > options.max_file_bytes {
             let parsed = ParsedFile {
                 diagnostic: Some(format!(
@@ -126,7 +138,8 @@ pub fn scan_project(root: &Path, options: ScanOptions) -> Result<crate::model::P
             skipped_count += 1;
             continue;
         }
-        let parsed = parse_source(&content, source.language, &source.relative);
+        let parser = parsers.entry(source.language).or_insert_with(Parser::new);
+        let parsed = parse_source(parser, &content, source.language, &source.relative);
         store.replace_file(
             &source.relative,
             &hash,
@@ -134,6 +147,7 @@ pub fn scan_project(root: &Path, options: ScanOptions) -> Result<crate::model::P
             source.language.label(),
             &parsed,
         )?;
+        store.record_size(&source.relative, source.length)?;
         parsed_count += 1;
     }
 
@@ -141,10 +155,11 @@ pub fn scan_project(root: &Path, options: ScanOptions) -> Result<crate::model::P
         for (path, record) in existing {
             if !seen.contains(&path) {
                 store.delete_file(record.id)?;
+                deleted_count += 1;
             }
         }
     }
-    let relationships = if cancelled {
+    let relationships = if cancelled || (parsed_count == 0 && deleted_count == 0) {
         store.rollback_scan()?;
         store.count("edges")?
     } else {
@@ -161,7 +176,7 @@ pub fn scan_project(root: &Path, options: ScanOptions) -> Result<crate::model::P
         }
     };
     store.summary(
-        sources.len(),
+        files_seen,
         parsed_count,
         skipped_count,
         relationships,
@@ -178,11 +193,19 @@ pub fn dependencies(root: &Path, target: &str, depth: u32) -> Result<QueryResult
 }
 
 fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<QueryResult> {
+    query_store(&Store::read(root)?, target, depth, reverse)
+}
+
+pub(crate) fn query_store(
+    store: &Store,
+    target: &str,
+    depth: u32,
+    reverse: bool,
+) -> Result<QueryResult> {
     let target = target.trim();
     if target.is_empty() || target.len() > MAX_TARGET_BYTES {
         anyhow::bail!("target must contain between 1 and {MAX_TARGET_BYTES} bytes");
     }
-    let store = Store::open(root)?;
     let target_records = store.find_symbols(target)?;
     let mode = if reverse { "impact" } else { "dependencies" }.to_owned();
     if target_records.is_empty() {
@@ -193,8 +216,8 @@ fn run_query(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Que
             mode,
             target: target.to_owned(),
             results: vec![],
-            candidates: Store::candidates(&target_records),
-            complete: true,
+            candidates: Store::candidates(&target_records[..target_records.len().min(50)]),
+            complete: target_records.len() <= 50,
             visited: 0,
             message: Some("More than one symbol matches this name.".to_owned()),
         });
@@ -305,7 +328,7 @@ pub fn search(root: &Path, query: &str, limit: usize) -> Result<SearchResult> {
         anyhow::bail!("search query must contain between 1 and {MAX_TARGET_BYTES} bytes");
     }
     let limit = limit.clamp(1, 100);
-    let store = Store::open(root)?;
+    let store = Store::read(root)?;
     let (records, complete) = store.search_symbols(query, limit)?;
     Ok(SearchResult {
         items: Store::candidates(&records),
@@ -320,13 +343,33 @@ pub fn graph(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Gra
             target: query.target,
             nodes: vec![],
             edges: vec![],
-            complete: true,
+            complete: query.complete,
             message: query.message,
         });
     }
-    let store = Store::open(root)?;
+    let store = Store::read(root)?;
     let selected = store.find_symbols(&query.target)?.into_iter().next();
     let mut nodes = Vec::new();
+    let mut members_complete = true;
+    if let Some(ref symbol) = selected {
+        if symbol.kind == "File" {
+            let members = store.file_members(symbol.file_id, MAX_GRAPH_NODES)?;
+            members_complete = members.len() < MAX_GRAPH_NODES;
+            for id in members.into_iter().take(MAX_GRAPH_NODES - 1) {
+                if let Some(m) = store.symbol(id)? {
+                    nodes.push(GraphNode {
+                        id: m.qualified_name,
+                        label: m.name,
+                        kind: m.kind,
+                        path: m.path,
+                        line: m.line,
+                        depth: 1,
+                        selected: false,
+                    });
+                }
+            }
+        }
+    }
     if let Some(symbol) = selected {
         nodes.push(GraphNode {
             id: symbol.qualified_name.clone(),
@@ -363,27 +406,18 @@ pub fn graph(root: &Path, target: &str, depth: u32, reverse: bool) -> Result<Gra
         .iter()
         .map(|node| node.id.as_str())
         .collect::<HashSet<_>>();
-    let mut edge_keys = HashSet::new();
-    let mut edges = Vec::new();
-    for item in &query.results {
-        for pair in item.evidence_path.windows(2) {
-            if node_ids.contains(pair[0].as_str()) && node_ids.contains(pair[1].as_str()) {
-                let key = (pair[0].clone(), pair[1].clone());
-                if edge_keys.insert(key.clone()) {
-                    edges.push(GraphEdge {
-                        source: key.0,
-                        target: key.1,
-                        kind: item.relationship.clone(),
-                    });
-                }
-            }
-        }
-    }
+    let (edges, edges_complete) = store.graph_edges(&node_ids)?;
     Ok(GraphResult {
         target: query.target,
+        complete: query.complete
+            && members_complete
+            && query
+                .results
+                .iter()
+                .all(|r| node_ids.contains(r.qualified_name.as_str()))
+            && edges_complete,
         nodes,
         edges,
-        complete: query.complete && query.results.len() <= MAX_GRAPH_NODES,
         message: query.message,
     })
 }
@@ -403,7 +437,7 @@ pub fn context_preview(
     let budget_tokens = budget_tokens
         .unwrap_or(DEFAULT_CONTEXT_TOKENS)
         .clamp(1_000, MAX_CONTEXT_TOKENS);
-    let store = Store::open(root)?;
+    let store = Store::read(root)?;
     let mut records = Vec::new();
     let mut seen = HashSet::new();
     let mut selection_complete = true;
@@ -482,15 +516,17 @@ pub fn context_preview(
             break;
         }
         let mut source = None;
+        let mut content_hash = None;
         let mut item_tokens = metadata_tokens;
         if include_source {
             let end_line = record
                 .end_line
                 .saturating_add(1)
                 .min(record.line.saturating_add(80));
-            if let Ok(mut excerpt) =
-                source_excerpt(root, &record.path, record.line as usize, end_line as usize)
+            if let Ok((mut excerpt, hash)) =
+                source_snapshot(root, &record.path, record.line as usize, end_line as usize)
             {
+                content_hash = Some(hash);
                 let available = budget_tokens.saturating_sub(estimated_tokens + metadata_tokens);
                 let max_chars = available.saturating_mul(4).min(4_000);
                 if excerpt.len() > max_chars {
@@ -511,10 +547,11 @@ pub fn context_preview(
             id: format!("E{}", index + 1),
             qualified_name: record.qualified_name,
             kind: record.kind,
-            path: record.path,
+            path: record.path.clone(),
             start_line: record.line,
             end_line: record.end_line,
             relationship,
+            content_hash,
             source,
             estimated_tokens: item_tokens,
         });
@@ -524,8 +561,15 @@ pub fn context_preview(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let fingerprint =
-        serde_json::to_vec(&(question, &target, &revision, &evidence, &model_endpoint))?;
+    let model_config_hash = crate::ai::configuration_fingerprint();
+    let fingerprint = serde_json::to_vec(&(
+        question,
+        &target,
+        &revision,
+        &evidence,
+        &model_endpoint,
+        &model_config_hash,
+    ))?;
     let digest = Sha256::digest(&fingerprint);
     Ok(ContextPreview {
         preview_id: hex::encode(&digest[..16]),
@@ -537,6 +581,7 @@ pub fn context_preview(
         budget_tokens,
         complete,
         model_endpoint,
+        model_config_hash,
     })
 }
 
@@ -579,25 +624,23 @@ pub fn source_excerpt(
     start_line: usize,
     end_line: usize,
 ) -> Result<String> {
+    Ok(source_snapshot(root, relative_path, start_line, end_line)?.0)
+}
+fn source_snapshot(
+    root: &Path,
+    relative_path: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Result<(String, String)> {
     if start_line == 0 || end_line < start_line {
         anyhow::bail!("source line range is invalid");
     }
     if end_line.saturating_sub(start_line) > MAX_SOURCE_EXCERPT_LINES {
         anyhow::bail!("source excerpt is limited to {MAX_SOURCE_EXCERPT_LINES} lines");
     }
-    let root = root.canonicalize()?;
-    let candidate = root.join(relative_path).canonicalize()?;
-    if !candidate.starts_with(&root) || !candidate.is_file() {
-        anyhow::bail!("source path is outside the selected project or is not a file");
-    }
-    let metadata = candidate.metadata()?;
-    if metadata.len() > DEFAULT_MAX_FILE_BYTES {
-        anyhow::bail!("source file exceeds the safe preview size");
-    }
-    let mut text = String::new();
-    File::open(candidate)?
-        .take(DEFAULT_MAX_FILE_BYTES + 1)
-        .read_to_string(&mut text)?;
+    let bytes = crate::safety::read(root, Path::new(relative_path), DEFAULT_MAX_FILE_BYTES)?;
+    let hash = hex::encode(Sha256::digest(&bytes));
+    let text = String::from_utf8(bytes)?;
     let excerpt = text
         .lines()
         .enumerate()
@@ -608,7 +651,7 @@ pub fn source_excerpt(
     if excerpt.len() as u64 > MAX_SOURCE_EXCERPT_BYTES {
         anyhow::bail!("source excerpt exceeds the safe response size");
     }
-    Ok(excerpt)
+    Ok((excerpt, hash))
 }
 fn is_cancelled(options: &ScanOptions) -> bool {
     options
@@ -617,122 +660,38 @@ fn is_cancelled(options: &ScanOptions) -> bool {
         .is_some_and(|value| value.load(Ordering::Relaxed))
 }
 
-fn discover_source_files(root: &Path, options: &ScanOptions) -> Result<Vec<SourceFile>> {
-    let ignores = read_ignore_rules(root);
-    let mut result = Vec::new();
-    visit_directory(root, root, &ignores, options, &mut result)?;
-    result.sort_by(|a, b| a.relative.cmp(&b.relative));
-    Ok(result)
-}
-
-fn visit_directory(
-    root: &Path,
-    directory: &Path,
-    ignores: &[String],
-    options: &ScanOptions,
-    result: &mut Vec<SourceFile>,
-) -> Result<()> {
-    for entry in fs::read_dir(directory)? {
-        if is_cancelled(options) {
-            return Ok(());
+fn discover_source_files(root: &Path) -> impl Iterator<Item = Result<SourceFile>> + '_ {
+    crate::safety::walker(root).filter_map(move |entry| {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => return Some(Err(e.into())),
+        };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            return None;
         }
-        let entry = entry?;
         let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        let relative_path = path
-            .strip_prefix(root)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() || ignored(&name, &relative_path, ignores) {
-            continue;
-        }
-        if file_type.is_dir() {
-            if should_skip_directory(&name) {
-                continue;
-            }
-            visit_directory(root, &path, ignores, options, result)?;
-        } else if file_type.is_file() {
-            let Some(language) = language_for_path(&path) else {
-                continue;
-            };
-            if result.len() >= MAX_DISCOVERED_FILES {
-                anyhow::bail!(
-                    "project exceeds the {MAX_DISCOVERED_FILES} source-file safety limit; add dependency or generated directories to .graphxploitignore"
-                );
-            }
+        let language = language_for_path(path)?;
+        Some((|| {
             let metadata = entry.metadata()?;
-            let modified_ns = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
-                .unwrap_or(0);
-            result.push(SourceFile {
-                absolute: path,
-                relative: relative_path,
+            Ok(SourceFile {
+                relative: path
+                    .strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
                 language,
-                modified_ns,
                 length: metadata.len(),
-            });
-        }
-    }
-    Ok(())
-}
-fn should_skip_directory(name: &str) -> bool {
-    matches!(
-        name,
-        ".git"
-            | ".hg"
-            | ".svn"
-            | "node_modules"
-            | "target"
-            | "dist"
-            | "build"
-            | "vendor"
-            | ".venv"
-            | "venv"
-            | "__pycache__"
-            | ".graphxploit"
-    ) || name.starts_with('.')
-}
-
-fn read_ignore_rules(root: &Path) -> Vec<String> {
-    let mut rules = vec!["*.min.js".to_owned()];
-    for filename in [".gitignore", ".graphxploitignore"] {
-        let path = root.join(filename);
-        let mut bytes = Vec::new();
-        let readable = File::open(path)
-            .and_then(|file| file.take(MAX_IGNORE_FILE_BYTES + 1).read_to_end(&mut bytes))
-            .is_ok();
-        if !readable || bytes.len() as u64 > MAX_IGNORE_FILE_BYTES {
-            continue;
-        }
-        if let Ok(text) = String::from_utf8(bytes) {
-            rules.extend(
-                text.lines()
-                    .map(str::trim)
-                    .filter(|line| {
-                        !line.is_empty() && !line.starts_with('#') && !line.starts_with('!')
-                    })
-                    .map(ToOwned::to_owned),
-            );
-        }
-    }
-    rules
-}
-fn ignored(name: &str, relative: &str, rules: &[String]) -> bool {
-    rules.iter().any(|rule| {
-        let rule = rule.trim_end_matches('/');
-        if let Some(suffix) = rule.strip_prefix('*') {
-            name.ends_with(suffix)
-        } else {
-            relative == rule || relative.starts_with(&format!("{rule}/")) || name == rule
-        }
+                modified_ns: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+                    .unwrap_or(0),
+            })
+        })())
     })
 }
 
-fn language_for_path(path: &Path) -> Option<Language> {
+pub(crate) fn language_for_path(path: &Path) -> Option<Language> {
     match path
         .extension()?
         .to_string_lossy()
@@ -750,8 +709,12 @@ fn language_for_path(path: &Path) -> Option<Language> {
     }
 }
 
-fn parse_source(source: &[u8], language: Language, relative_path: &str) -> ParsedFile {
-    let mut parser = Parser::new();
+fn parse_source(
+    parser: &mut Parser,
+    source: &[u8],
+    language: Language,
+    relative_path: &str,
+) -> ParsedFile {
     let ts_language = grammar(language);
     if parser.set_language(&ts_language).is_err() {
         return ParsedFile {
@@ -809,81 +772,67 @@ fn walk(
     scopes: &mut Vec<Scope>,
     parsed: &mut ParsedFile,
 ) {
-    if is_import(node.kind(), language) {
-        parsed.imports.push((
-            node_text(node, source),
-            node.start_position().row as u32 + 1,
-        ));
-    }
-    if let Some((kind, name)) = declaration(node, source, language) {
-        let local_qualified = if scopes.is_empty() {
-            name.clone()
-        } else {
-            format!(
-                "{}.{}",
-                scopes
-                    .iter()
-                    .map(|scope| scope.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join("."),
-                name
-            )
-        };
-        let base_qualified = format!("{relative_path}::{local_qualified}");
-        let qualified_name = if parsed
-            .symbols
-            .iter()
-            .any(|symbol| symbol.qualified_name == base_qualified)
-        {
-            format!(
-                "{base_qualified}@{}:{}",
-                node.start_position().row + 1,
-                node.start_position().column + 1
-            )
-        } else {
-            base_qualified
-        };
-        parsed.symbols.push(ParsedSymbol {
-            name: name.clone(),
-            qualified_name: qualified_name.clone(),
-            kind,
-            start_line: node.start_position().row as u32 + 1,
-            end_line: node.end_position().row as u32 + 1,
-        });
-        scopes.push(Scope {
-            name,
-            qualified_name,
-        });
-        walk_children(node, source, language, relative_path, scopes, parsed);
-        scopes.pop();
-        return;
-    }
-    if is_call(node.kind(), language) {
-        if let Some(scope) = scopes.last() {
-            let raw_target = call_target(node, source);
-            if !raw_target.is_empty() {
-                parsed.references.push(ParsedReference {
-                    source_qualified_name: scope.qualified_name.clone(),
-                    raw_target,
-                    line: node.start_position().row as u32 + 1,
-                });
+    let mut stack = vec![(node, 0usize, 0usize)];
+    let mut visited = 0usize;
+    let mut names = HashSet::new();
+    while let Some((node, scope_count, depth)) = stack.pop() {
+        scopes.truncate(scope_count);
+        visited += 1;
+        if visited > 200_000 || stack.len() > 200_000 || depth > 512 {
+            parsed.diagnostic = Some("AST safety limit reached; file is partially indexed.".into());
+            break;
+        }
+        if is_import(node.kind(), language) {
+            parsed.imports.push((
+                node_text(node, source),
+                node.start_position().row as u32 + 1,
+            ));
+        }
+        if let Some((kind, name)) = declaration(node, source, language) {
+            let local = scopes
+                .iter()
+                .map(|s| s.name.as_str())
+                .chain(std::iter::once(name.as_str()))
+                .collect::<Vec<_>>()
+                .join(".");
+            let base = format!("{relative_path}::{local}");
+            let qualified_name = if names.insert(base.clone()) {
+                base
+            } else {
+                format!(
+                    "{base}@{}:{}",
+                    node.start_position().row + 1,
+                    node.start_position().column + 1
+                )
+            };
+            parsed.symbols.push(ParsedSymbol {
+                name: name.clone(),
+                qualified_name: qualified_name.clone(),
+                kind,
+                start_line: node.start_position().row as u32 + 1,
+                end_line: node.end_position().row as u32 + 1,
+            });
+            scopes.push(Scope {
+                name,
+                qualified_name,
+            });
+        } else if is_call(node.kind(), language) {
+            if let Some(scope) = scopes.last() {
+                let raw_target = call_target(node, source);
+                if !raw_target.is_empty() {
+                    parsed.references.push(ParsedReference {
+                        source_qualified_name: scope.qualified_name.clone(),
+                        raw_target,
+                        line: node.start_position().row as u32 + 1,
+                    });
+                }
             }
         }
-    }
-    walk_children(node, source, language, relative_path, scopes, parsed);
-}
-
-fn walk_children(
-    node: Node<'_>,
-    source: &[u8],
-    language: Language,
-    relative_path: &str,
-    scopes: &mut Vec<Scope>,
-    parsed: &mut ParsedFile,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, source, language, relative_path, scopes, parsed);
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        for child in children.into_iter().rev() {
+            stack.push((child, scopes.len(), depth + 1));
+        }
     }
 }
 fn declaration(node: Node<'_>, source: &[u8], language: Language) -> Option<(String, String)> {
@@ -981,6 +930,18 @@ fn is_import(kind: &str, _language: Language) -> bool {
 }
 
 fn call_target(node: Node<'_>, source: &[u8]) -> String {
+    if node.kind() == "method_invocation" {
+        if let (Some(receiver), Some(name)) = (
+            node.child_by_field_name("object"),
+            node.child_by_field_name("name"),
+        ) {
+            return format!(
+                "{}.{}",
+                node_text(receiver, source),
+                node_text(name, source)
+            );
+        }
+    }
     let target = node
         .child_by_field_name("function")
         .or_else(|| node.child_by_field_name("name"));
