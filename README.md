@@ -4,7 +4,7 @@
 
 GraphXploit is a lightweight, local code-intelligence workbench. It indexes a repository without executing it, visualizes static relationships, maps Git changes to affected symbols, and prepares compact evidence for codebase questions.
 
-No TigerGraph, Docker, Python, Node.js, bundled browser, GPU, or model download is required.
+
 
 ## Choose an edition
 
