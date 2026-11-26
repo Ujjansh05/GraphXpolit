@@ -25,7 +25,7 @@ command-group = "5.0.1"
 tempfile = "3.15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { version = "1.54.1", features = ["macros", "rt", "net", "signal"] }
 tree-sitter = "0.25"
 # tree-sitter-language 0.1.8 requires Rust 1.90, including in MSRV CI.
